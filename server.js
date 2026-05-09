@@ -1,11 +1,5 @@
-// ============================================================
-// OPS LOG PALEMBANG — Agent Backend
-// Integrasi: Claude API + Google Sheets + Fonnte (WA) + Telegram
-// ============================================================
-
 require('dotenv').config();
 const express = require('express');
-const { google } = require('googleapis');
 const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
 const cron = require('node-cron');
@@ -13,244 +7,161 @@ const cron = require('node-cron');
 const app = express();
 app.use(express.json());
 
-// ─── CONFIG ───────────────────────────────────────────────
 const ANTHROPIC_KEY    = process.env.ANTHROPIC_API_KEY;
 const SHEET_ID         = process.env.GOOGLE_SHEETS_ID;
 const SHEET_TAB        = process.env.SHEET_TAB_NAME || 'Sheet1';
 const FONNTE_TOKEN     = process.env.FONNTE_TOKEN;
 const TELEGRAM_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_NOTIF_CHAT_ID; // chat ID untuk notifikasi H-1
-const YOUR_WA_NUMBER   = process.env.YOUR_WA_NUMBER;          // no WA kamu untuk notifikasi H-1
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_NOTIF_CHAT_ID;
+const YOUR_WA_NUMBER   = process.env.YOUR_WA_NUMBER;
 const PORT             = process.env.PORT || 3000;
 
-// ─── CLIENTS ──────────────────────────────────────────────
+console.log('=== ENV CHECK ===');
+console.log('ANTHROPIC_API_KEY:', ANTHROPIC_KEY ? 'OK' : 'MISSING');
+console.log('GOOGLE_SHEETS_ID:', SHEET_ID ? 'OK' : 'MISSING');
+console.log('SHEET_TAB_NAME:', SHEET_TAB);
+console.log('FONNTE_TOKEN:', FONNTE_TOKEN ? 'OK' : 'MISSING');
+console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN ? 'OK' : 'MISSING');
+console.log('TELEGRAM_NOTIF_CHAT_ID:', TELEGRAM_CHAT_ID ? 'OK' : 'MISSING');
+console.log('YOUR_WA_NUMBER:', YOUR_WA_NUMBER ? 'OK' : 'MISSING');
+console.log('=================');
+
+let sheets = null;
+async function getSheets() {
+  if (sheets) return sheets;
+  try {
+    const { google } = require('googleapis');
+    const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets'],
+    });
+    sheets = google.sheets({ version: 'v4', auth });
+    console.log('Google Sheets initialized OK');
+    return sheets;
+  } catch (e) {
+    console.error('Google Sheets init error:', e.message);
+    return null;
+  }
+}
+
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
-const googleAuth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS),
-  scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-});
-const sheets = google.sheets({ version: 'v4', auth: googleAuth });
-
-// ─── SYSTEM PROMPT ────────────────────────────────────────
 const SYSTEM_PROMPT = `
-Kamu adalah Agent Operasional OPS LOG Palembang 2026. Tugasmu membantu tim operasional mengelola data pengiriman yang tersimpan di Google Sheets.
-
-## IDENTITAS
-Nama: OPS Agent Palembang
-Bahasa: Indonesia (selalu)
-Nada: Profesional, singkat, dan to the point
-
-## KEMAMPUAN UTAMA
-
-### 1. Input & Update Resi
-Ketika user memberikan informasi resi, ekstrak:
-- No Order (contoh: ORD-PLM-001)
-- Nomor Resi
-- Ekspedisi (JNE, J&T, SiCepat, AnterAja, dll)
-
-Konfirmasi data sebelum menyimpan:
-"Saya akan menyimpan:
-• No Order: [no_order]
-• Ekspedisi: [ekspedisi]
-• Resi: [nomor_resi]
-Sudah benar? Balas 'ya' untuk konfirmasi."
-
-Setelah dikonfirmasi, balas: "ACTION:UPDATE_RESI:[no_order]:[resi]:[ekspedisi]"
-
-### 2. Monitor SLA & Aging
-Definisi:
-- AGING = order yang Tanggal Tiba sudah melewati SLA Max
-- SLA WARNING = order yang mendekati batas SLA (H-1 atau H-0 dari Tgl Wajib Kirim)
-- H-1 PENDING = order berstatus Pending/Belum Dikirim dengan Request Date = besok
-
-Format laporan:
-🔴 AGING (X order): [list no order + customer]
-🟡 SLA WARNING (X order): [list no order + customer]
-🟠 H-1 PENDING (X order): [list no order + customer]
-✅ ON TRACK (X order)
-
-### 3. Cek & Filter Data
-Jawab pertanyaan seperti:
-- "Order mana yang belum ada resi?"
-- "Tampilkan semua order ekspedisi JNE"
-- "Status order ORD-PLM-XXX?"
-- "Berapa order yang sudah delivered hari ini?"
-
-### 4. Update Status
-Untuk update status, gunakan format:
-"ACTION:UPDATE_STATUS:[no_order]:[status_baru]"
-
-Status yang valid: Pending, Diproses, Dalam Perjalanan, Delivered, Aging, SLA Warning
-
-## KOLOM DATA
-Tanggal, Cutoff, Shipping Number, Koli, Nama Barang, Partner, Nama Customer, Alamat,
-Kecamatan, Kota/Kabupaten, No. Telepon, Kode Pos, Provinsi, Ekspedisi,
-Driver/Booking/Resi, Tanggal Pengiriman, Tanggal Tiba, Aging, Request Date,
-Remark, Status, SLA, No Order, SLA Min, SLA Max, Tgl WAJIB Kirim (Order Create),
-Tgl Wajib Kirim (SLA), Shipping Status, tanggal_created, Tgl WAJIB Kirim (By Req),
-Request Date Pokedex, Request Compare, Aging SLA, Group SLA
-
-## ATURAN PENTING
-- Selalu konfirmasi sebelum melakukan perubahan data
-- Format tanggal selalu YYYY-MM-DD
-- Jika ada H-1 Pending yang resi-nya belum ada, ingatkan user
-- Gunakan emoji secukupnya: ✅ 🔴 🟡 🟠 📦
-- Jawaban singkat dan terstruktur
+Kamu adalah Agent Operasional OPS LOG Palembang 2026. Tugasmu membantu tim operasional mengelola data pengiriman.
+Bahasa: Indonesia. Nada: Profesional dan singkat.
+Jika data sheet tidak tersedia, tetap bantu user semampunya dan informasikan bahwa koneksi sheet sedang bermasalah.
 `.trim();
 
-// ─── GOOGLE SHEETS HELPERS ────────────────────────────────
 async function getSheetData() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_TAB}!A:AK`,
-  });
-  return res.data.values || [];
-}
-
-function colIndex(headers, name) {
-  return headers.indexOf(name);
-}
-
-function numToCol(n) {
-  let col = '';
-  while (n >= 0) {
-    col = String.fromCharCode(65 + (n % 26)) + col;
-    n = Math.floor(n / 26) - 1;
+  const s = await getSheets();
+  if (!s) return null;
+  try {
+    const res = await s.spreadsheets.values.get({
+      spreadsheetId: SHEET_ID,
+      range: `${SHEET_TAB}!A:AK`,
+    });
+    return res.data.values || [];
+  } catch (e) {
+    console.error('getSheetData error:', e.message);
+    return null;
   }
-  return col;
 }
 
-async function updateCell(row, col, value) {
-  const range = `${SHEET_TAB}!${numToCol(col)}${row}`;
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SHEET_ID,
-    range,
-    valueInputOption: 'RAW',
-    requestBody: { values: [[value]] },
-  });
-}
-
-async function updateResiInSheet(noOrder, resi, ekspedisi) {
-  const data = await getSheetData();
-  if (!data.length) return false;
-  const headers = data[0];
-  const noOrderIdx = colIndex(headers, 'No Order');
-  const resiIdx    = colIndex(headers, 'Driver/Booking/Resi');
-  const ekspIdx    = colIndex(headers, 'Ekspedisi');
-  const statusIdx  = colIndex(headers, 'Status');
-
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][noOrderIdx] === noOrder) {
-      const sheetRow = i + 1;
-      await updateCell(sheetRow, resiIdx, resi);
-      if (ekspedisi) await updateCell(sheetRow, ekspIdx, ekspedisi);
-      if (data[i][statusIdx] === 'Pending') {
-        await updateCell(sheetRow, statusIdx, 'Diproses');
-      }
-      return true;
-    }
-  }
-  return false;
-}
-
-async function updateStatusInSheet(noOrder, status) {
-  const data = await getSheetData();
-  if (!data.length) return false;
-  const headers = data[0];
-  const noOrderIdx = colIndex(headers, 'No Order');
-  const statusIdx  = colIndex(headers, 'Status');
-
-  for (let i = 1; i < data.length; i++) {
-    if (data[i][noOrderIdx] === noOrder) {
-      await updateCell(i + 1, statusIdx, status);
-      return true;
-    }
-  }
-  return false;
-}
-
-// ─── CLAUDE HELPER ────────────────────────────────────────
-const conversationHistory = {}; // { senderId: [messages] }
+const chatHistory = {};
 
 async function callClaude(senderId, userMessage) {
   const sheetData = await getSheetData();
   const today = new Date().toISOString().split('T')[0];
-  const dataContext = `\nTanggal hari ini: ${today}\n\nData Google Sheet:\n${JSON.stringify(sheetData, null, 2)}`;
+  let dataContext = `Tanggal hari ini: ${today}\n`;
+  if (sheetData) {
+    dataContext += `Data Google Sheet:\n${JSON.stringify(sheetData, null, 2)}`;
+  } else {
+    dataContext += `(Koneksi ke Google Sheet sedang tidak tersedia)`;
+  }
 
-  if (!conversationHistory[senderId]) conversationHistory[senderId] = [];
-  conversationHistory[senderId].push({ role: 'user', content: userMessage });
-
-  // Keep last 10 messages to avoid token overflow
-  const messages = conversationHistory[senderId].slice(-10);
+  if (!chatHistory[senderId]) chatHistory[senderId] = [];
+  chatHistory[senderId].push({ role: 'user', content: userMessage });
+  const messages = chatHistory[senderId].slice(-10);
 
   const response = await anthropic.messages.create({
     model: 'claude-sonnet-4-20250514',
     max_tokens: 1000,
-    system: SYSTEM_PROMPT + dataContext,
+    system: SYSTEM_PROMPT + '\n\n' + dataContext,
     messages,
   });
 
-  const replyText = response.content.map(c => c.text || '').join('');
-  conversationHistory[senderId].push({ role: 'assistant', content: replyText });
-
-  // Parse ACTION commands from Claude's response
-  await parseAndExecuteActions(replyText);
-
-  // Clean display text (remove ACTION: lines from reply to user)
-  const displayText = replyText.replace(/ACTION:[^\n]+/g, '').trim();
-  return displayText;
-}
-
-async function parseAndExecuteActions(text) {
-  const lines = text.split('\n');
-  for (const line of lines) {
-    if (line.startsWith('ACTION:UPDATE_RESI:')) {
-      const parts = line.split(':');
-      // ACTION:UPDATE_RESI:[no_order]:[resi]:[ekspedisi]
-      const noOrder   = parts[2];
-      const resi      = parts[3];
-      const ekspedisi = parts[4] || '';
-      if (noOrder && resi) {
-        const ok = await updateResiInSheet(noOrder, resi, ekspedisi);
-        console.log(`Update resi ${noOrder}: ${ok ? 'OK' : 'not found'}`);
-      }
-    }
-
-    if (line.startsWith('ACTION:UPDATE_STATUS:')) {
-      const parts  = line.split(':');
-      const noOrder = parts[2];
-      const status  = parts[3];
-      if (noOrder && status) {
-        const ok = await updateStatusInSheet(noOrder, status);
-        console.log(`Update status ${noOrder} → ${status}: ${ok ? 'OK' : 'not found'}`);
-      }
-    }
-  }
-}
-
-// ─── MESSAGING HELPERS ────────────────────────────────────
-async function sendWA(target, message) {
-  await axios.post('https://api.fonnte.com/send', {
-    target,
-    message,
-  }, {
-    headers: { Authorization: FONNTE_TOKEN },
-  });
+  const reply = response.content.map(c => c.text || '').join('');
+  chatHistory[senderId].push({ role: 'assistant', content: reply });
+  return reply;
 }
 
 async function sendTelegram(chatId, message) {
-  await axios.post(
-    `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`,
-    { chat_id: chatId, text: message, parse_mode: 'HTML' }
-  );
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+    const res = await axios.post(url, { chat_id: chatId, text: message });
+    console.log('Telegram sent OK to', chatId);
+    return res.data;
+  } catch (e) {
+    console.error('sendTelegram error:', e.response?.data || e.message);
+  }
 }
 
-// ─── WEBHOOKS ─────────────────────────────────────────────
+async function sendWA(target, message) {
+  try {
+    await axios.post('https://api.fonnte.com/send', { target, message }, {
+      headers: { Authorization: FONNTE_TOKEN },
+    });
+    console.log('WA sent OK to', target);
+  } catch (e) {
+    console.error('sendWA error:', e.message);
+  }
+}
 
-// WhatsApp via Fonnte
+// Health check
+app.get('/health', (_, res) => {
+  res.json({
+    status: 'ok',
+    env: {
+      anthropic: !!ANTHROPIC_KEY,
+      sheets: !!SHEET_ID,
+      fonnte: !!FONNTE_TOKEN,
+      telegram: !!TELEGRAM_TOKEN,
+    }
+  });
+});
+
+// Test kirim pesan Telegram
+app.get('/test-telegram', async (req, res) => {
+  const chatId = req.query.chat_id || TELEGRAM_CHAT_ID;
+  if (!chatId) return res.json({ error: 'Tambahkan ?chat_id=xxxxx di URL' });
+  await sendTelegram(chatId, 'Test dari OPS Agent! Bot aktif ✅');
+  res.json({ sent: true, to: chatId });
+});
+
+// Telegram webhook
+app.post('/webhook/telegram', async (req, res) => {
+  res.sendStatus(200);
+  console.log('Telegram webhook received:', JSON.stringify(req.body));
+  const msg = req.body.message || req.body.edited_message;
+  if (!msg) { console.log('No message in body'); return; }
+  if (!msg.text) { console.log('No text in message'); return; }
+  const chatId = msg.chat.id;
+  const text = msg.text;
+  console.log(`TG [${chatId}]: ${text}`);
+  try {
+    const reply = await callClaude(`tg_${chatId}`, text);
+    await sendTelegram(chatId, reply);
+  } catch (e) {
+    console.error('Telegram handler error:', e.message);
+    await sendTelegram(chatId, 'Maaf, terjadi error: ' + e.message);
+  }
+});
+
+// WA webhook
 app.post('/webhook/wa', async (req, res) => {
   res.sendStatus(200);
+  console.log('WA webhook received:', JSON.stringify(req.body));
   const { sender, message } = req.body;
   if (!sender || !message) return;
   console.log(`WA [${sender}]: ${message}`);
@@ -258,100 +169,48 @@ app.post('/webhook/wa', async (req, res) => {
     const reply = await callClaude(`wa_${sender}`, message);
     await sendWA(sender, reply);
   } catch (e) {
-    console.error('WA error:', e.message);
-    await sendWA(sender, 'Maaf, terjadi error. Coba lagi sebentar.');
+    console.error('WA handler error:', e.message);
+    await sendWA(sender, 'Maaf, terjadi error: ' + e.message);
   }
 });
 
-// Telegram Bot
-app.post('/webhook/telegram', async (req, res) => {
-  res.sendStatus(200);
-  const msg = req.body.message || req.body.edited_message;
-  if (!msg || !msg.text) return;
-  const chatId = msg.chat.id;
-  const text   = msg.text;
-  console.log(`TG [${chatId}]: ${text}`);
-  try {
-    const reply = await callClaude(`tg_${chatId}`, text);
-    await sendTelegram(chatId, reply);
-  } catch (e) {
-    console.error('Telegram error:', e.message);
-    await sendTelegram(chatId, 'Maaf, terjadi error. Coba lagi.');
-  }
-});
-
-// Health check
-app.get('/health', (_, res) => res.json({ status: 'ok' }));
-
-// ─── H-1 NOTIFICATION SCHEDULER ──────────────────────────
-// Jalan setiap hari pukul 08:00 WIB (UTC+7 = 01:00 UTC)
+// H-1 Scheduler jam 08:00 WIB (01:00 UTC)
 cron.schedule('0 1 * * *', async () => {
-  console.log('Running H-1 notification check...');
+  console.log('Running H-1 check...');
   try {
     const data = await getSheetData();
-    if (!data.length) return;
-
+    if (!data || !data.length) return;
     const headers = data[0];
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     const tomorrowStr = tomorrow.toISOString().split('T')[0];
-
-    const noOrderIdx  = colIndex(headers, 'No Order');
-    const customerIdx = colIndex(headers, 'Nama Customer');
-    const reqDateIdx  = colIndex(headers, 'Request Date');
-    const statusIdx   = colIndex(headers, 'Status');
-    const resiIdx     = colIndex(headers, 'Driver/Booking/Resi');
-    const ekspIdx     = colIndex(headers, 'Ekspedisi');
-
-    const h1Orders = data.slice(1).filter(row => {
-      const reqDate = (row[reqDateIdx] || '').trim();
-      const status  = (row[statusIdx] || '').trim();
-      return reqDate === tomorrowStr && status !== 'Delivered';
-    });
-
-    if (!h1Orders.length) {
-      console.log('No H-1 pending orders today.');
-      return;
-    }
-
-    let msg = `🔔 <b>H-1 PENDING REMINDER</b>\n`;
-    msg += `Request Date besok: <b>${tomorrowStr}</b>\n\n`;
-
+    const noOrderIdx  = headers.indexOf('No Order');
+    const customerIdx = headers.indexOf('Nama Customer');
+    const reqDateIdx  = headers.indexOf('Request Date');
+    const statusIdx   = headers.indexOf('Status');
+    const resiIdx     = headers.indexOf('Driver/Booking/Resi');
+    const ekspIdx     = headers.indexOf('Ekspedisi');
+    const h1Orders = data.slice(1).filter(row =>
+      (row[reqDateIdx] || '').trim() === tomorrowStr && (row[statusIdx] || '') !== 'Delivered'
+    );
+    if (!h1Orders.length) return;
+    let msg = `🔔 H-1 PENDING REMINDER\nRequest Date besok: ${tomorrowStr}\n\n`;
     h1Orders.forEach(row => {
-      const no       = row[noOrderIdx] || '—';
-      const customer = row[customerIdx] || '—';
-      const eksp     = row[ekspIdx] || '—';
-      const resi     = row[resiIdx] || '';
-      msg += `📦 <b>${no}</b> — ${customer} (${eksp})\n`;
-      msg += resi
-        ? `   ✅ Resi: ${resi}\n`
-        : `   ❌ Resi belum diinput!\n`;
+      msg += `📦 ${row[noOrderIdx]} — ${row[customerIdx]} (${row[ekspIdx] || '—'})\n`;
+      msg += row[resiIdx] ? `  ✅ Resi: ${row[resiIdx]}\n` : `  ❌ Resi belum diinput!\n`;
     });
-
     msg += `\nTotal: ${h1Orders.length} order`;
-
-    // Kirim ke Telegram
-    if (TELEGRAM_CHAT_ID) {
-      await sendTelegram(TELEGRAM_CHAT_ID, msg);
-      console.log('H-1 notification sent to Telegram.');
-    }
-
-    // Kirim ke WA
-    if (YOUR_WA_NUMBER) {
-      const waMsg = msg.replace(/<[^>]+>/g, ''); // strip HTML tags for WA
-      await sendWA(YOUR_WA_NUMBER, waMsg);
-      console.log('H-1 notification sent to WhatsApp.');
-    }
-
+    if (TELEGRAM_CHAT_ID) await sendTelegram(TELEGRAM_CHAT_ID, msg);
+    if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
   } catch (e) {
     console.error('H-1 scheduler error:', e.message);
   }
 });
 
-// ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`OPS LOG Agent running on port ${PORT}`);
-  console.log(`Webhooks:`);
-  console.log(`  POST /webhook/wa       → WhatsApp (Fonnte)`);
-  console.log(`  POST /webhook/telegram → Telegram Bot`);
+  console.log(`  POST /webhook/wa`);
+  console.log(`  POST /webhook/telegram`);
+  console.log(`  GET  /health`);
+  console.log(`  GET  /test-telegram?chat_id=xxx`);
 });
