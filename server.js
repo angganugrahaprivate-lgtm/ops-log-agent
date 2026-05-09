@@ -138,6 +138,8 @@ app.get('/test-telegram', async (req, res) => {
   await sendTelegram(chatId, 'Test dari OPS Agent! Bot aktif ✅');
   res.json({ sent: true, to: chatId });
 });
+app.get('/webhook/telegram', (_, res) => res.sendStatus(200));
+app.get('/webhook/wa', (_, res) => res.sendStatus(200));
 
 // Telegram webhook
 app.post('/webhook/telegram', async (req, res) => {
