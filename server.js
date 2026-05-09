@@ -85,7 +85,7 @@ async function callClaude(senderId, userMessage) {
   const messages = chatHistory[senderId].slice(-10);
 
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-20250514',
+    model: 'claude-sonnet-4-5',
     max_tokens: 1000,
     system: SYSTEM_PROMPT + '\n\n' + dataContext,
     messages,
