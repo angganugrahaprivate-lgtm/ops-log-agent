@@ -74,8 +74,10 @@ async function callClaude(senderId, userMessage) {
   const sheetData = await getSheetData();
   const today = new Date().toISOString().split('T')[0];
   let dataContext = `Tanggal hari ini: ${today}\n`;
-  if (sheetData) {
-    dataContext += `Data Google Sheet:\n${JSON.stringify(sheetData, null, 2)}`;
+if (sheetData) {
+    const headers = sheetData[0] || [];
+    const rows = sheetData.slice(1).slice(-100); // ambil 100 baris terakhir saja
+    dataContext += `Data Google Sheet (100 baris terakhir):\nHeader: ${JSON.stringify(headers)}\nRows: ${JSON.stringify(rows)}`;
   } else {
     dataContext += `(Koneksi ke Google Sheet sedang tidak tersedia)`;
   }
