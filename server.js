@@ -505,7 +505,7 @@ async function callGemini(senderId, userMessage, imageBase64 = null, imageMime =
     parts: [{ text: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) }],
   }));
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash-latest', systemInstruction: context });
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash-lite', systemInstruction: context });
   const chat  = model.startChat({ history });
 
   let parts = [];
@@ -582,7 +582,7 @@ async function getTelegramPhotoBase64(fileId) {
 }
 
 // ─── WEBHOOKS ─────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ status: 'ok', model: 'gemini-1.5-flash-latest' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', model: 'gemini-2.5-flash-lite' }));
 app.get('/webhook/telegram', (_, res) => res.sendStatus(200));
 app.get('/webhook/wa', (_, res) => res.sendStatus(200));
 app.get('/test-telegram', async (req, res) => {
