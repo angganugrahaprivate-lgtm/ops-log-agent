@@ -24,9 +24,27 @@ console.log('GEMINI_API_KEY:', GEMINI_KEY ? 'OK' : 'MISSING');
 console.log('GOOGLE_SHEETS_ID:', SHEET_ID ? 'OK' : 'MISSING');
 console.log('FONNTE_TOKEN:', FONNTE_TOKEN ? 'OK' : 'MISSING');
 console.log('TELEGRAM_BOT_TOKEN:', TELEGRAM_TOKEN ? 'OK' : 'MISSING');
+console.log('TZ:', process.env.TZ || 'not set');
 console.log('=================');
 
 const genAI = new GoogleGenerativeAI(GEMINI_KEY);
+
+// ─── CACHE (5 menit) ──────────────────────────────────────
+const cache = {};
+const CACHE_TTL = 5 * 60 * 1000;
+
+function getCache(key) {
+  const c = cache[key];
+  if (c && Date.now() - c.time < CACHE_TTL) return c.data;
+  return null;
+}
+function setCache(key, data) {
+  cache[key] = { data, time: Date.now() };
+}
+function clearCache(key) {
+  if (key) delete cache[key];
+  else Object.keys(cache).forEach(k => delete cache[k]);
+}
 
 // ─── GOOGLE SHEETS ────────────────────────────────────────
 let sheetsClient = null;
@@ -51,11 +69,16 @@ function toCol(n) {
 }
 
 async function getSheetData() {
+  const cached = getCache('sheetData');
+  if (cached) { console.log('Sheet data from cache'); return cached; }
   const s = await getSheets();
   if (!s) return null;
   try {
     const res = await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${SHEET_TAB}!A:AK` });
-    return res.data.values || [];
+    const data = res.data.values || [];
+    setCache('sheetData', data);
+    console.log(`Sheet data loaded: ${data.length} rows`);
+    return data;
   } catch (e) { console.error('getSheetData error:', e.message); return null; }
 }
 
@@ -68,6 +91,7 @@ async function updateCell(sheetTab, row, colIdx, value) {
     valueInputOption: 'RAW',
     requestBody: { values: [[value]] },
   });
+  clearCache('sheetData'); // invalidate cache setelah update
 }
 
 async function updateResiInSheet(noOrder, resi, ekspedisi) {
@@ -115,29 +139,35 @@ async function updateStatusInSheet(noOrder, status) {
   } catch (e) { console.error('updateStatus error:', e.message); return false; }
 }
 
-// ─── MEMORY SYSTEM ────────────────────────────────────────
+// ─── MEMORY & REMINDER ────────────────────────────────────
 async function ensureTab(tabName, headers) {
   const s = await getSheets();
   if (!s) return;
   try {
     await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${tabName}!A1` });
   } catch (e) {
-    const { google } = require('googleapis');
-    const auth = new google.auth.GoogleAuth({ credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS), scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
-    const api = google.sheets({ version: 'v4', auth });
-    await api.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: [{ addSheet: { properties: { title: tabName } } }] } });
-    await api.spreadsheets.values.update({ spreadsheetId: SHEET_ID, range: `${tabName}!A1`, valueInputOption: 'RAW', requestBody: { values: [headers] } });
-    console.log(`Tab "${tabName}" created`);
+    try {
+      const { google } = require('googleapis');
+      const auth = new google.auth.GoogleAuth({ credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS), scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+      const api = google.sheets({ version: 'v4', auth });
+      await api.spreadsheets.batchUpdate({ spreadsheetId: SHEET_ID, requestBody: { requests: [{ addSheet: { properties: { title: tabName } } }] } });
+      await api.spreadsheets.values.update({ spreadsheetId: SHEET_ID, range: `${tabName}!A1`, valueInputOption: 'RAW', requestBody: { values: [headers] } });
+      console.log(`Tab "${tabName}" created`);
+    } catch (e2) { console.error('ensureTab error:', e2.message); }
   }
 }
 
 async function getMemory() {
+  const cached = getCache('memory');
+  if (cached) return cached;
   await ensureTab(MEMORY_TAB, ['Timestamp', 'Category', 'Content']);
   const s = await getSheets();
   if (!s) return [];
   try {
     const res = await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${MEMORY_TAB}!A:C` });
-    return (res.data.values || []).slice(1).slice(-30);
+    const data = (res.data.values || []).slice(1).slice(-30);
+    setCache('memory', data);
+    return data;
   } catch (e) { return []; }
 }
 
@@ -146,20 +176,24 @@ async function saveMemory(category, content) {
   const s = await getSheets();
   if (!s) return;
   try {
-    const ts = new Date().toISOString().replace('T', ' ').split('.')[0];
+    const ts = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
     await s.spreadsheets.values.append({ spreadsheetId: SHEET_ID, range: `${MEMORY_TAB}!A:C`, valueInputOption: 'RAW', requestBody: { values: [[ts, category, content]] } });
+    clearCache('memory');
     console.log(`Memory: [${category}] ${content}`);
   } catch (e) { console.error('saveMemory error:', e.message); }
 }
 
-// ─── REMINDER SYSTEM ──────────────────────────────────────
 async function getReminders() {
+  const cached = getCache('reminders');
+  if (cached) return cached;
   await ensureTab(REMINDER_TAB, ['Timestamp', 'No Order', 'Tanggal Reminder', 'Note', 'Status']);
   const s = await getSheets();
   if (!s) return [];
   try {
     const res = await s.spreadsheets.values.get({ spreadsheetId: SHEET_ID, range: `${REMINDER_TAB}!A:E` });
-    return (res.data.values || []).slice(1);
+    const data = (res.data.values || []).slice(1);
+    setCache('reminders', data);
+    return data;
   } catch (e) { return []; }
 }
 
@@ -168,8 +202,9 @@ async function saveReminder(noOrder, tanggal, note) {
   const s = await getSheets();
   if (!s) return false;
   try {
-    const ts = new Date().toISOString().replace('T', ' ').split('.')[0];
+    const ts = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
     await s.spreadsheets.values.append({ spreadsheetId: SHEET_ID, range: `${REMINDER_TAB}!A:E`, valueInputOption: 'RAW', requestBody: { values: [[ts, noOrder || '', tanggal, note, 'Pending']] } });
+    clearCache('reminders');
     console.log(`Reminder saved: ${noOrder} on ${tanggal}`);
     return true;
   } catch (e) { console.error('saveReminder error:', e.message); return false; }
@@ -179,7 +214,8 @@ async function markReminderDone(rowIndex) {
   const s = await getSheets();
   if (!s) return;
   try {
-    await updateCell(REMINDER_TAB, rowIndex + 2, 4, 'Sent'); // col E = index 4
+    await updateCell(REMINDER_TAB, rowIndex + 2, 4, 'Sent');
+    clearCache('reminders');
   } catch (e) { console.error('markReminderDone error:', e.message); }
 }
 
@@ -204,8 +240,7 @@ function filterByIntent(data, intent, message) {
   if (!data || data.length < 2) return data;
   const h = data[0];
   const rows = data.slice(1);
-  const today = new Date().toISOString().split('T')[0];
-
+  const today = new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Jakarta' });
   const idx = {
     noOrder:  h.indexOf('No Order'),
     customer: h.indexOf('Nama Customer'),
@@ -213,9 +248,7 @@ function filterByIntent(data, intent, message) {
     resi:     h.indexOf('Driver/Booking/Resi'),
     eksp:     h.indexOf('Ekspedisi'),
     tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)'),
-    tanggal:  h.indexOf('Tanggal'),
   };
-
   let filtered;
   switch (intent) {
     case 'pending':
@@ -251,34 +284,28 @@ function filterByIntent(data, intent, message) {
       const matchEksp = ekspKeywords.find(k => message.toLowerCase().includes(k));
       filtered = matchEksp ? rows.filter(r => (r[idx.eksp] || '').toLowerCase().includes(matchEksp)) : rows.slice(-100);
       break;
-    case 'summary':
-    case 'analytics':
-    case 'reminder':
-    case 'general':
     default:
       filtered = rows.slice(-200);
       break;
   }
-
-  console.log(`Smart filter [${intent}]: ${filtered.length} rows from ${rows.length}`);
+  console.log(`Smart filter [${intent}]: ${filtered.length}/${rows.length} rows`);
   return [h, ...filtered];
 }
 
-// ─── SERVER-SIDE MONITORING COMPUTE ───────────────────────
+// ─── MONITORING ───────────────────────────────────────────
+function getToday() {
+  return new Date().toLocaleDateString('sv-SE', { timeZone: 'Asia/Jakarta' });
+}
+
 function computeSLAAlerts(data) {
   if (!data || data.length < 2) return null;
   const h = data[0];
-  const today = new Date(); today.setHours(0,0,0,0);
-  const todayStr = today.toISOString().split('T')[0];
+  const today = getToday();
   const idx = {
-    noOrder:  h.indexOf('No Order'),
-    customer: h.indexOf('Nama Customer'),
-    kota:     h.indexOf('Kota / Kabupaten'),
-    status:   h.indexOf('Status'),
-    eksp:     h.indexOf('Ekspedisi'),
-    produk:   h.indexOf('Nama Barang'),
-    resi:     h.indexOf('Driver/Booking/Resi'),
-    tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)'),
+    noOrder: h.indexOf('No Order'), customer: h.indexOf('Nama Customer'),
+    kota: h.indexOf('Kota / Kabupaten'), status: h.indexOf('Status'),
+    eksp: h.indexOf('Ekspedisi'), produk: h.indexOf('Nama Barang'),
+    resi: h.indexOf('Driver/Booking/Resi'), tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)'),
   };
   const result = { urgent: [], warning: [], attention: [], overdue: [] };
   data.slice(1).forEach(row => {
@@ -286,8 +313,7 @@ function computeSLAAlerts(data) {
     if (status === 'Delivered') return;
     const slaStr = row[idx.tglWajib];
     if (!slaStr) return;
-    const sla = new Date(slaStr); sla.setHours(0,0,0,0);
-    const diff = Math.round((sla - today) / 86400000);
+    const diff = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
     const info = { no_order: row[idx.noOrder], customer: row[idx.customer], kota: row[idx.kota], status, sla: slaStr, eksp: row[idx.eksp], produk: row[idx.produk], resi: row[idx.resi], diff };
     if (diff < 0) result.overdue.push(info);
     else if (diff === 0) result.urgent.push(info);
@@ -300,203 +326,122 @@ function computeSLAAlerts(data) {
 function computeDailySummary(data) {
   if (!data || data.length < 2) return null;
   const h = data[0];
-  const todayStr = new Date().toISOString().split('T')[0];
+  const today = getToday();
   const idx = {
-    tanggal:  h.indexOf('Tanggal'),
-    status:   h.indexOf('Status'),
-    resi:     h.indexOf('Driver/Booking/Resi'),
-    kota:     h.indexOf('Kota / Kabupaten'),
+    tanggal: h.indexOf('Tanggal'), status: h.indexOf('Status'),
+    resi: h.indexOf('Driver/Booking/Resi'), kota: h.indexOf('Kota / Kabupaten'),
     tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)'),
-    noOrder:  h.indexOf('No Order'),
-    customer: h.indexOf('Nama Customer'),
-    eksp:     h.indexOf('Ekspedisi'),
   };
-  const today = new Date(); today.setHours(0,0,0,0);
   const rows = data.slice(1);
-  const receivedToday = rows.filter(r => (r[idx.tanggal] || '').startsWith(todayStr));
-  const shippedToday  = rows.filter(r => r[idx.status] === 'Delivered' && (r[idx.tanggal] || '').startsWith(todayStr));
+  const receivedToday = rows.filter(r => (r[idx.tanggal] || '').startsWith(today));
+  const shippedToday  = rows.filter(r => r[idx.status] === 'Delivered' && (r[idx.tanggal] || '').startsWith(today));
   const waiting       = rows.filter(r => /waiting|pending/i.test(r[idx.status] || ''));
   const noResi        = rows.filter(r => !(r[idx.resi] || '').trim() && r[idx.status] !== 'Delivered');
-  const overdue       = rows.filter(r => { const sla = r[idx.tglWajib]; return sla && sla < todayStr && r[idx.status] !== 'Delivered'; });
-  const slaH2         = rows.filter(r => {
-    const sla = r[idx.tglWajib];
-    if (!sla || r[idx.status] === 'Delivered') return false;
-    const diff = Math.round((new Date(sla) - today) / 86400000);
-    return diff === 2;
-  });
+  const overdue       = rows.filter(r => { const sla = r[idx.tglWajib]; return sla && sla < today && r[idx.status] !== 'Delivered'; });
   const kotaCount = {};
   rows.filter(r => r[idx.status] !== 'Delivered').forEach(r => {
     const kota = r[idx.kota] || 'Unknown';
     kotaCount[kota] = (kotaCount[kota] || 0) + 1;
   });
-  const topKota = Object.entries(kotaCount).sort((a,b) => b[1]-a[1]).slice(0, 3);
-  return { receivedToday, shippedToday, waiting, noResi, overdue, slaH2, topKota };
+  return { receivedToday: receivedToday.length, shippedToday: shippedToday.length, waiting: waiting.length, noResi: noResi.length, overdue: overdue.length, topKota: Object.entries(kotaCount).sort((a,b) => b[1]-a[1]).slice(0,3) };
 }
 
-function computeEkspedisiReport(data, ekspFilter = null) {
+function computeEkspedisiReport(data) {
   if (!data || data.length < 2) return null;
   const h = data[0];
-  const today = new Date().toISOString().split('T')[0];
-  const idx = {
-    eksp:     h.indexOf('Ekspedisi'),
-    status:   h.indexOf('Status'),
-    tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)'),
-    tanggalTiba: h.indexOf('Tanggal Tiba'),
-    aging:    h.indexOf('Aging'),
-  };
+  const today = getToday();
+  const idx = { eksp: h.indexOf('Ekspedisi'), status: h.indexOf('Status'), tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)'), tanggalTiba: h.indexOf('Tanggal Tiba'), aging: h.indexOf('Aging') };
   const report = {};
   data.slice(1).forEach(row => {
     const eksp = row[idx.eksp] || 'Unknown';
-    if (ekspFilter && !eksp.toLowerCase().includes(ekspFilter.toLowerCase())) return;
-    if (!report[eksp]) report[eksp] = { total: 0, ontime: 0, late: 0, pending: 0, totalAging: 0, agingCount: 0 };
+    if (!report[eksp]) report[eksp] = { total: 0, ontime: 0, late: 0, pending: 0 };
     report[eksp].total++;
     const status = row[idx.status] || '';
     const sla = row[idx.tglWajib] || '';
     if (status === 'Delivered') {
-      if (sla && (row[idx.tanggalTiba] || '') <= sla) report[eksp].ontime++;
-      else report[eksp].late++;
-    } else if (sla && sla < today) {
-      report[eksp].late++;
-    } else {
-      report[eksp].pending++;
-    }
-    const aging = parseFloat(row[idx.aging]);
-    if (!isNaN(aging)) { report[eksp].totalAging += aging; report[eksp].agingCount++; }
+      (sla && (row[idx.tanggalTiba] || '') <= sla) ? report[eksp].ontime++ : report[eksp].late++;
+    } else if (sla && sla < today) { report[eksp].late++; }
+    else { report[eksp].pending++; }
   });
   return report;
 }
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────
 const SYSTEM_PROMPT = `
-Kamu adalah Agent Operasional OPS LOG Palembang 2026 yang cerdas dan adaptif.
+Kamu adalah Agent Operasional OPS LOG Palembang yang cerdas dan adaptif.
 Kamu BISA membaca DAN menulis ke Google Sheet.
 Bahasa: Indonesia. Nada: Profesional tapi santai.
 
 ## KEMAMPUAN
-1. Baca & analisis data order dari Google Sheet (sudah difilter relevan)
-2. Update resi order → ACTION:UPDATE_RESI:[no_order]:[resi]:[ekspedisi]
-3. Update status order → ACTION:UPDATE_STATUS:[no_order]:[status]
+1. Analisis data order dari Google Sheet
+2. Update resi → ACTION:UPDATE_RESI:[no_order]:[resi]:[ekspedisi]
+3. Update status → ACTION:UPDATE_STATUS:[no_order]:[status]
 4. Simpan memory → ACTION:SAVE_MEMORY:[category]:[content]
-5. Simpan reminder → ACTION:SAVE_REMINDER:[no_order]:[tanggal_YYYY-MM-DD]:[note]
-6. Baca foto resi dan ekstrak nomor resi otomatis
-7. Monitor SLA, overdue, summary harian, dan performa ekspedisi
+5. Set reminder → ACTION:SAVE_REMINDER:[no_order]:[YYYY-MM-DD]:[note]
+6. Baca foto resi (OCR)
+7. Monitor SLA, overdue, summary, performa ekspedisi
 
-## FORMAT OUTPUT MONITORING
+## FORMAT MONITORING
+Alert SLA: 🔴 URGENT (H-0) | 🟡 WARNING (H-1) | 🟠 ATTENTION (H-2) | 🚨 OVERDUE
+Summary: 📊 SUMMARY | ✅ Received | 📦 Shipped | ⏳ Waiting | 🚨 Needs Attention
+Ekspedisi: 📈 PERFORMA [eksp] | Total | On-time | Late | Pending
+Reminder: 🔔 REMINDER [tgl] | 📌 [note] | 📦 [order info]
 
-### Alert SLA (tersedia di konteks sebagai slaAlerts):
-🔴 URGENT (H-0): ...
-🟡 WARNING (H-1): ...
-🟠 ATTENTION (H-2): ...
-
-### Overdue:
-🚨 ORDER OVERDUE
-[list order]
-
-### Daily Summary (tersedia di konteks sebagai dailySummary):
-📊 SUMMARY OPERASIONAL - [tanggal]
-✅ Received Today: [n] order
-📦 Shipped Today: [n] order
-⏳ Waiting: [n] order
-🚨 NEEDS ATTENTION: ...
-📍 TOP WILAYAH: ...
-
-### Reminder:
-🔔 REMINDER [tanggal]
-📌 [note]
-📦 Order: [no_order] - [customer] - [status]
-
-### Performance Ekspedisi:
-📈 PERFORMA [nama eksp]
-• Total: [n] | On-time: [n] ([%]) | Late: [n] | Pending: [n]
-• Avg Aging: [n] hari
-
-## CARA UPDATE RESI
-Konfirmasi dulu sebelum simpan. Setelah user bilang "ya":
-ACTION:UPDATE_RESI:[no_order]:[resi]:[ekspedisi]
-
-## CARA SET REMINDER
-Setelah user set reminder:
-- Konfirmasi ke user dengan format yang rapi
-- Tambahkan di akhir: ACTION:SAVE_REMINDER:[no_order]:[YYYY-MM-DD]:[note]
-
-## ATURAN PENTING
-- ACTION hanya di akhir pesan, jangan tampilkan ke user
+## ATURAN
+- ACTION hanya di akhir pesan, jangan tampilkan
 - JANGAN gunakan LINK WA Customer tanpa perintah eksplisit
-- Gunakan data monitoring yang sudah dicompute (slaAlerts, dailySummary, ekspReport)
-- Selalu konfirmasi sebelum update data
+- Konfirmasi sebelum update data
+- Gunakan data monitoring yang sudah dicompute di konteks
 `.trim();
 
-// ─── GEMINI CHAT ──────────────────────────────────────────
+// ─── GEMINI ───────────────────────────────────────────────
 const chatHistory = {};
 
 async function callGemini(senderId, userMessage, imageBase64 = null, imageMime = 'image/jpeg') {
   const intent = detectIntent(userMessage || '');
+  const today  = getToday();
+
+  // Load semua data paralel (dari cache kalau ada)
   const [rawData, memories, reminders] = await Promise.all([getSheetData(), getMemory(), getReminders()]);
   const filteredData = filterByIntent(rawData, intent, userMessage || '');
-  const today = new Date().toISOString().split('T')[0];
 
-  // Pre-compute monitoring data
-  const slaAlerts   = computeSLAAlerts(rawData);
+  // Pre-compute hanya yang dibutuhkan
+  const slaAlerts    = computeSLAAlerts(rawData);
   const dailySummary = (intent === 'summary') ? computeDailySummary(rawData) : null;
   const ekspReport   = (intent === 'analytics') ? computeEkspedisiReport(rawData) : null;
+  const todayReminders = reminders.filter(r => r[2] === today && r[4] === 'Pending');
+  const upcomingReminders = reminders.filter(r => r[2] >= today && r[4] === 'Pending');
 
-  // Check today's reminders
-  const todayReminders = reminders.filter((r, i) => r[2] === today && r[4] === 'Pending');
+  let context = SYSTEM_PROMPT + `\n\nTanggal hari ini (WIB): ${today}\n\n`;
 
-  let context = SYSTEM_PROMPT + `\n\nTanggal hari ini: ${today}\n\n`;
-
-  // Memory
   if (memories.length > 0) {
     context += `=== MEMORY ===\n`;
     memories.forEach(m => { context += `[${m[1]}] ${m[2]}\n`; });
     context += '\n';
   }
-
-  // Today's reminders
   if (todayReminders.length > 0) {
     context += `=== REMINDER HARI INI ===\n`;
-    todayReminders.forEach((r, i) => {
-      context += `- Order: ${r[1] || '-'} | Note: ${r[3]} | (Row index: ${i})\n`;
-    });
+    todayReminders.forEach(r => { context += `Order: ${r[1] || '-'} | ${r[3]}\n`; });
     context += '\n';
   }
-
-  // All reminders list
-  const upcomingReminders = reminders.filter(r => r[2] >= today && r[4] === 'Pending');
   if (upcomingReminders.length > 0) {
     context += `=== UPCOMING REMINDERS ===\n`;
     upcomingReminders.forEach(r => { context += `[${r[2]}] Order: ${r[1] || '-'} | ${r[3]}\n`; });
     context += '\n';
   }
-
-  // SLA Alerts pre-computed
   if (slaAlerts) {
-    context += `=== SLA ALERTS (PRE-COMPUTED) ===\n`;
-    context += `Urgent (H-0): ${slaAlerts.urgent.length} order\n`;
-    if (slaAlerts.urgent.length) context += JSON.stringify(slaAlerts.urgent) + '\n';
-    context += `Warning (H-1): ${slaAlerts.warning.length} order\n`;
-    if (slaAlerts.warning.length) context += JSON.stringify(slaAlerts.warning) + '\n';
-    context += `Attention (H-2): ${slaAlerts.attention.length} order\n`;
-    if (slaAlerts.attention.length) context += JSON.stringify(slaAlerts.attention) + '\n';
-    context += `Overdue: ${slaAlerts.overdue.length} order\n`;
-    if (slaAlerts.overdue.length) context += JSON.stringify(slaAlerts.overdue) + '\n';
+    context += `=== SLA ALERTS ===\n`;
+    context += `Overdue: ${slaAlerts.overdue.length} | Urgent H-0: ${slaAlerts.urgent.length} | Warning H-1: ${slaAlerts.warning.length} | Attention H-2: ${slaAlerts.attention.length}\n`;
+    if (slaAlerts.overdue.length) context += `Overdue: ${JSON.stringify(slaAlerts.overdue)}\n`;
+    if (slaAlerts.urgent.length) context += `Urgent: ${JSON.stringify(slaAlerts.urgent)}\n`;
+    if (slaAlerts.warning.length) context += `Warning: ${JSON.stringify(slaAlerts.warning)}\n`;
+    if (slaAlerts.attention.length) context += `Attention: ${JSON.stringify(slaAlerts.attention)}\n`;
     context += '\n';
   }
-
-  // Daily Summary
-  if (dailySummary) {
-    context += `=== DAILY SUMMARY (PRE-COMPUTED) ===\n${JSON.stringify(dailySummary)}\n\n`;
-  }
-
-  // Ekspedisi Report
-  if (ekspReport) {
-    context += `=== EKSPEDISI REPORT (PRE-COMPUTED) ===\n${JSON.stringify(ekspReport)}\n\n`;
-  }
-
-  // Filtered sheet data
+  if (dailySummary) context += `=== DAILY SUMMARY ===\n${JSON.stringify(dailySummary)}\n\n`;
+  if (ekspReport)   context += `=== EKSPEDISI REPORT ===\n${JSON.stringify(ekspReport)}\n\n`;
   if (filteredData && filteredData.length > 1) {
-    context += `=== DATA SHEET (filtered: ${intent}, ${filteredData.length - 1} rows) ===\n`;
-    context += JSON.stringify(filteredData);
+    context += `=== DATA SHEET [${intent}, ${filteredData.length - 1} rows] ===\n${JSON.stringify(filteredData)}\n`;
   }
 
   if (!chatHistory[senderId]) chatHistory[senderId] = [];
@@ -519,13 +464,12 @@ async function callGemini(senderId, userMessage, imageBase64 = null, imageMime =
   chatHistory[senderId].push({ role: 'assistant', content: reply });
   if (chatHistory[senderId].length > 20) chatHistory[senderId] = chatHistory[senderId].slice(-20);
 
-  await parseActions(reply, todayReminders);
+  await parseActions(reply);
   return reply.replace(/ACTION:[^\n]+/g, '').trim();
 }
 
-async function parseActions(text, todayReminders = []) {
-  const lines = text.split('\n');
-  for (const line of lines) {
+async function parseActions(text) {
+  for (const line of text.split('\n')) {
     const t = line.trim();
     if (t.startsWith('ACTION:UPDATE_RESI:')) {
       const p = t.split(':');
@@ -541,18 +485,9 @@ async function parseActions(text, todayReminders = []) {
       if (idx > -1) await saveMemory(rest.substring(0, idx), rest.substring(idx + 1));
     }
     if (t.startsWith('ACTION:SAVE_REMINDER:')) {
-      const rest = t.replace('ACTION:SAVE_REMINDER:', '');
+      const rest  = t.replace('ACTION:SAVE_REMINDER:', '');
       const parts = rest.split(':');
-      if (parts.length >= 3) {
-        const noOrder = parts[0];
-        const tanggal = parts[1];
-        const note    = parts.slice(2).join(':');
-        await saveReminder(noOrder, tanggal, note);
-      }
-    }
-    if (t.startsWith('ACTION:MARK_REMINDER_DONE:')) {
-      const idx = parseInt(t.replace('ACTION:MARK_REMINDER_DONE:', ''));
-      if (!isNaN(idx)) await markReminderDone(idx);
+      if (parts.length >= 3) await saveReminder(parts[0], parts[1], parts.slice(2).join(':'));
     }
   }
 }
@@ -582,13 +517,13 @@ async function getTelegramPhotoBase64(fileId) {
 }
 
 // ─── WEBHOOKS ─────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ status: 'ok', model: 'gemini-2.5-flash-lite' }));
+app.get('/health', (_, res) => res.json({ status: 'ok', model: 'gemini-2.5-flash-lite', timezone: process.env.TZ || 'UTC', time_wib: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }) }));
 app.get('/webhook/telegram', (_, res) => res.sendStatus(200));
 app.get('/webhook/wa', (_, res) => res.sendStatus(200));
 app.get('/test-telegram', async (req, res) => {
   const chatId = req.query.chat_id || TELEGRAM_CHAT_ID;
   if (!chatId) return res.json({ error: 'Tambahkan ?chat_id=xxx' });
-  await sendTelegram(chatId, 'OPS Agent (Gemini) aktif ✅');
+  await sendTelegram(chatId, `OPS Agent aktif ✅\nWaktu WIB: ${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`);
   res.json({ sent: true });
 });
 
@@ -604,7 +539,7 @@ app.post('/webhook/telegram', async (req, res) => {
     if (!text) text = 'Tolong baca nomor resi dari foto ini.';
   }
   if (!text && !imageBase64) return;
-  console.log(`TG [${chatId}]: ${text.substring(0, 100)}`);
+  console.log(`TG [${chatId}]: ${text.substring(0, 80)}`);
   try {
     const reply = await callGemini(`tg_${chatId}`, text, imageBase64);
     await sendTelegram(chatId, reply);
@@ -618,7 +553,7 @@ app.post('/webhook/wa', async (req, res) => {
   res.sendStatus(200);
   const { sender, message } = req.body;
   if (!sender || !message) return;
-  console.log(`WA [${sender}]: ${message.substring(0, 100)}`);
+  console.log(`WA [${sender}]: ${message.substring(0, 80)}`);
   try {
     const reply = await callGemini(`wa_${sender}`, message);
     await sendWA(sender, reply);
@@ -628,19 +563,21 @@ app.post('/webhook/wa', async (req, res) => {
   }
 });
 
-// ─── SCHEDULERS (jam 08:00 WIB = 01:00 UTC) ──────────────
-cron.schedule('0 1 * * *', async () => {
-  console.log('=== DAILY SCHEDULER START ===');
+// ─── SCHEDULER — 08:00 WIB (dengan TZ=Asia/Jakarta) ──────
+cron.schedule('0 8 * * *', async () => {
+  console.log('=== DAILY SCHEDULER 08:00 WIB ===');
   try {
-    const data = await getSheetData();
-    const today = new Date().toISOString().split('T')[0];
-    const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toISOString().split('T')[0];
+    const data  = await getSheetData();
+    const today = getToday();
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Jakarta' });
 
-    // ── H-1 Pending Reminder
     if (data) {
       const h = data[0];
       const idx = { noOrder: h.indexOf('No Order'), customer: h.indexOf('Nama Customer'), reqDate: h.indexOf('Request Date'), status: h.indexOf('Status'), resi: h.indexOf('Driver/Booking/Resi'), eksp: h.indexOf('Ekspedisi') };
+
+      // H-1 Pending
       const h1 = data.slice(1).filter(r => (r[idx.reqDate] || '').trim() === tomorrowStr && (r[idx.status] || '') !== 'Delivered');
       if (h1.length > 0) {
         let msg = `🔔 H-1 PENDING REMINDER\nRequest Date besok: ${tomorrowStr}\n\n`;
@@ -653,59 +590,43 @@ cron.schedule('0 1 * * *', async () => {
         if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
       }
 
-      // ── SLA Alert harian
+      // SLA Alert
       const sla = computeSLAAlerts(data);
       if (sla && (sla.urgent.length > 0 || sla.overdue.length > 0)) {
         let msg = `⚠️ ALERT SLA - ${today}\n\n`;
-        if (sla.overdue.length > 0) {
-          msg += `🚨 OVERDUE (${sla.overdue.length} order):\n`;
-          sla.overdue.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla} | ${o.status}\n`; });
-          msg += '\n';
-        }
-        if (sla.urgent.length > 0) {
-          msg += `🔴 URGENT H-0 (${sla.urgent.length} order):\n`;
-          sla.urgent.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | ${o.eksp || '—'} | ${o.status}\n`; });
-          msg += '\n';
-        }
-        if (sla.warning.length > 0) {
-          msg += `🟡 WARNING H-1 (${sla.warning.length} order):\n`;
-          sla.warning.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; });
-        }
+        if (sla.overdue.length) { msg += `🚨 OVERDUE (${sla.overdue.length}):\n`; sla.overdue.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; }); msg += '\n'; }
+        if (sla.urgent.length)  { msg += `🔴 URGENT H-0 (${sla.urgent.length}):\n`;  sla.urgent.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | ${o.eksp || '—'}\n`; }); msg += '\n'; }
+        if (sla.warning.length) { msg += `🟡 WARNING H-1 (${sla.warning.length}):\n`; sla.warning.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; }); }
         if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
+        if (TELEGRAM_CHAT_ID) await sendTelegram(TELEGRAM_CHAT_ID, msg);
       }
     }
 
-    // ── Reminder Check
+    // Reminder check
+    clearCache('reminders');
     const reminders = await getReminders();
     const todayReminders = reminders.filter(r => r[2] === today && r[4] === 'Pending');
     for (let i = 0; i < todayReminders.length; i++) {
       const r = todayReminders[i];
-      const noOrder = r[1];
-      const note    = r[3];
-
-      // Cari info order
       let orderInfo = '';
-      if (data && noOrder) {
+      if (data && r[1]) {
         const h = data[0];
         const idx = { noOrder: h.indexOf('No Order'), customer: h.indexOf('Nama Customer'), status: h.indexOf('Status'), produk: h.indexOf('Nama Barang'), tglWajib: h.indexOf('Tgl Wajib Kirim (SLA)') };
-        const orderRow = data.slice(1).find(row => (row[idx.noOrder] || '').includes(noOrder));
-        if (orderRow) {
-          orderInfo = `\n📦 Order: ${orderRow[idx.noOrder]}\n   Customer: ${orderRow[idx.customer]}\n   Produk: ${orderRow[idx.produk] || '—'}\n   Status: ${orderRow[idx.status] || '—'}\n   SLA: ${orderRow[idx.tglWajib] || '—'}`;
-        }
+        const row = data.slice(1).find(row => (row[idx.noOrder] || '').includes(r[1]));
+        if (row) orderInfo = `\n📦 ${row[idx.noOrder]} - ${row[idx.customer]}\n   Produk: ${row[idx.produk] || '—'}\n   Status: ${row[idx.status] || '—'}\n   SLA: ${row[idx.tglWajib] || '—'}`;
       }
-
-      const msg = `🔔 REMINDER HARI INI - ${today}\n📌 ${note}${orderInfo}\n\nReminder ini otomatis dari OPS Agent.`;
+      const msg = `🔔 REMINDER HARI INI - ${today}\n📌 ${r[3]}${orderInfo}`;
       if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
       await markReminderDone(reminders.indexOf(todayReminders[i]));
-      console.log(`Reminder sent: ${note}`);
     }
 
-    console.log('=== DAILY SCHEDULER DONE ===');
+    console.log('=== SCHEDULER DONE ===');
   } catch (e) { console.error('Scheduler error:', e.message); }
-});
+}, { timezone: 'Asia/Jakarta' });
 
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`OPS LOG Agent (Gemini 2.0 Flash) running on port ${PORT}`);
-  console.log(`Features: Smart Filter | SLA Alert | Overdue | Daily Summary | Ekspedisi Report | Reminder`);
+  console.log(`OPS LOG Agent running on port ${PORT}`);
+  console.log(`Timezone: ${process.env.TZ || 'UTC (set TZ=Asia/Jakarta di Railway)'}`);
+  console.log(`Model: gemini-2.5-flash-lite`);
 });
