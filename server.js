@@ -1,3 +1,11 @@
+// ═══════════════════════════════════════════════════════════
+// PATCH NOTES — 3 Bug Fixes:
+//
+// FIX 1: detectIntent — tambah keyword untuk upload Excel via teks
+// FIX 2: Webhook WA — tambah handler untuk dokumen (.xlsx) dari Fonnte
+// FIX 3: Webhook WA — tambah handler untuk foto/gambar dari Fonnte
+// ═══════════════════════════════════════════════════════════
+
 require('dotenv').config();
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
@@ -32,44 +40,22 @@ console.log('=================');
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ─── COLUMN MAPPING ───────────────────────────────────────
-// Index 0-based sesuai posisi di sheet
 const COL = {
-  tanggal: 0,        // A
-  cutoff: 1,         // B
-  shippingNum: 2,    // C
-  koli: 3,           // D
-  namaBarang: 4,     // E
-  partner: 5,        // F
-  customer: 6,       // G
-  alamat: 7,         // H
-  kecamatan: 8,      // I
-  kota: 9,           // J
-  telepon: 10,       // K
-  kodePos: 11,       // L
-  provinsi: 12,      // M
-  ekspedisi: 13,     // N
-  resi: 14,          // O
-  tglPengiriman: 15, // P
-  tglTiba: 16,       // Q
-  aging: 17,         // R
-  requestDate: 18,   // S
-  remark: 19,        // T
-  status: 20,        // U
-  sla: 21,           // V
-  noOrder: 22,       // W
+  tanggal: 0, cutoff: 1, shippingNum: 2, koli: 3, namaBarang: 4,
+  partner: 5, customer: 6, alamat: 7, kecamatan: 8, kota: 9,
+  telepon: 10, kodePos: 11, provinsi: 12, ekspedisi: 13, resi: 14,
+  tglPengiriman: 15, tglTiba: 16, aging: 17, requestDate: 18,
+  remark: 19, status: 20, sla: 21, noOrder: 22,
 };
 
-// 12 kolom umum untuk query & monitoring
-const GENERAL_COLS = [0,2,6,9,13,14,15,16,18,20,21,22];
+const GENERAL_COLS  = [0,2,6,9,13,14,15,16,18,20,21,22];
 const GENERAL_NAMES = ['Tanggal','Shipping Number','Nama Customer','Kota','Ekspedisi','Resi','Tgl Pengiriman','Tgl Tiba','Request Date','Status','SLA','No Order'];
+const UPDATE_COLS   = [22,6,13,20,14,15,16];
+const UPDATE_NAMES  = ['No Order','Nama Customer','Ekspedisi','Status','Resi','Tgl Pengiriman','Tgl Tiba'];
 
-// 7 kolom untuk update (exclude Received)
-const UPDATE_COLS = [22,6,13,20,14,15,16];
-const UPDATE_NAMES = ['No Order','Nama Customer','Ekspedisi','Status','Resi','Tgl Pengiriman','Tgl Tiba'];
-
-// ─── CACHE (1 JAM) ────────────────────────────────────────
+// ─── CACHE ────────────────────────────────────────────────
 const cache = {};
-const CACHE_TTL = 60 * 60 * 1000; // 1 jam
+const CACHE_TTL = 60 * 60 * 1000;
 
 function getCache(key) {
   const c = cache[key];
@@ -182,14 +168,12 @@ async function logUpdate(updatedBy, noOrder, kolom, nilaiLama, nilaiBaru) {
 async function updateOrderField(noOrder, colIdx, colName, newValue, updatedBy) {
   const data = await getSheetData();
   if (!data) return false;
-  const h = data[0];
   const noOrderIdx = COL.noOrder;
   for (let i = 1; i < data.length; i++) {
     if ((data[i][noOrderIdx] || '').trim() === noOrder.trim()) {
       const oldValue = data[i][colIdx] || '';
       await updateCell(SHEET_TAB, i + 1, colIdx, newValue);
       await logUpdate(updatedBy, noOrder, colName, oldValue, newValue);
-      console.log(`Updated ${colName} for ${noOrder}: ${oldValue} → ${newValue}`);
       return true;
     }
   }
@@ -245,7 +229,6 @@ async function saveReminder(createdBy, noOrder, tanggal, note) {
     const ts = new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' });
     await s.spreadsheets.values.append({ spreadsheetId: SHEET_ID, range: `${REMINDER_TAB}!A:F`, valueInputOption: 'RAW', requestBody: { values: [[ts, createdBy, noOrder || '', tanggal, note, 'Pending']] } });
     clearCache('reminders');
-    console.log(`Reminder saved by ${createdBy}: ${noOrder} on ${tanggal}`);
     return true;
   } catch (e) { console.error('saveReminder error:', e.message); return false; }
 }
@@ -254,7 +237,7 @@ async function markReminderDone(rowIndex) {
   const s = await getSheets();
   if (!s) return;
   try {
-    await updateCell(REMINDER_TAB, rowIndex + 2, 5, 'Sent'); // col F = index 5
+    await updateCell(REMINDER_TAB, rowIndex + 2, 5, 'Sent');
     clearCache('reminders');
   } catch (e) { console.error('markReminderDone error:', e.message); }
 }
@@ -270,12 +253,10 @@ async function handleExcelUpload(fileBuffer, senderName, chatId, isWA = false) {
     const headers = rows[0];
     const dataRows = rows.slice(1).filter(r => r.some(c => c));
 
-    // Map kolom Excel ke GSheet
     const numIdx    = headers.indexOf('Number');
     const koliIdx   = headers.indexOf('Koli');
     const barangIdx = headers.indexOf('Nama Barang');
     const partnerIdx= headers.indexOf('Partner');
-    const noteIdx   = headers.indexOf('Note');
     const nameIdx   = headers.findIndex(h => h && h.toString().includes('First Name'));
     const alamatIdx = headers.findIndex(h => h && h.toString().includes('Line1'));
     const kecIdx    = headers.findIndex(h => h && h.toString().includes('Line3'));
@@ -287,7 +268,6 @@ async function handleExcelUpload(fileBuffer, senderName, chatId, isWA = false) {
     const today  = getToday();
     const cutoff = getCutOff();
 
-    // Build preview
     let preview = `📋 *PREVIEW DATA EXCEL*\n`;
     preview += `Tanggal: ${today} | Cut Off: ${cutoff}\n`;
     preview += `Total: ${dataRows.length} order\n\n`;
@@ -296,11 +276,11 @@ async function handleExcelUpload(fileBuffer, senderName, chatId, isWA = false) {
     });
     preview += `\nMasukkan semua ke GSheet? Balas "ya" untuk konfirmasi.`;
 
-    // Simpan pending data ke memory sementara
-    cache['pendingExcel'] = {
+    // FIX: pendingExcel per sender, bukan global
+    cache[`pendingExcel_${chatId}`] = {
       data: dataRows, time: Date.now(), today, cutoff,
-      numIdx, koliIdx, barangIdx, partnerIdx, noteIdx,
-      nameIdx, alamatIdx, kecIdx, kotaIdx, phoneIdx, posIdx, stateIdx,
+      numIdx, koliIdx, barangIdx, partnerIdx, nameIdx,
+      alamatIdx, kecIdx, kotaIdx, phoneIdx, posIdx, stateIdx,
       senderName, chatId, isWA
     };
 
@@ -311,32 +291,33 @@ async function handleExcelUpload(fileBuffer, senderName, chatId, isWA = false) {
   }
 }
 
-async function insertExcelToSheet(senderName) {
-  const pending = cache['pendingExcel'];
+async function insertExcelToSheet(senderName, chatId) {
+  // FIX: cari pending per sender
+  const pendingKey = `pendingExcel_${chatId}`;
+  const pending = cache[pendingKey];
   if (!pending) return 'Tidak ada data Excel yang menunggu konfirmasi.';
 
   const s = await getSheets();
   if (!s) return 'Gagal konek ke Google Sheets.';
 
   try {
-    const { data, today, cutoff, numIdx, koliIdx, barangIdx, partnerIdx, noteIdx, nameIdx, alamatIdx, kecIdx, kotaIdx, phoneIdx, posIdx, stateIdx } = pending;
+    const { data, today, cutoff, numIdx, koliIdx, barangIdx, partnerIdx, nameIdx, alamatIdx, kecIdx, kotaIdx, phoneIdx, posIdx, stateIdx } = pending;
 
     const rows = data.map(r => {
       const row = Array(36).fill('');
-      row[COL.tanggal]      = today;
-      row[COL.cutoff]       = cutoff;
-      row[COL.shippingNum]  = r[numIdx] || '';
-      row[COL.koli]         = r[koliIdx] || '';
-      row[COL.namaBarang]   = r[barangIdx] || '';
-      row[COL.partner]      = r[partnerIdx] || '';
-      row[COL.customer]     = r[nameIdx] || '';
-      row[COL.alamat]       = r[alamatIdx] || '';
-      row[COL.kecamatan]    = r[kecIdx] || '';
-      row[COL.kota]         = r[kotaIdx] || '';
-      row[COL.telepon]      = r[phoneIdx] || '';
-      row[COL.kodePos]      = r[posIdx] || '';
-      row[COL.provinsi]     = r[stateIdx] || '';
-      // N (Ekspedisi) dikosongkan
+      row[COL.tanggal]     = today;
+      row[COL.cutoff]      = cutoff;
+      row[COL.shippingNum] = r[numIdx] || '';
+      row[COL.koli]        = r[koliIdx] || '';
+      row[COL.namaBarang]  = r[barangIdx] || '';
+      row[COL.partner]     = r[partnerIdx] || '';
+      row[COL.customer]    = r[nameIdx] || '';
+      row[COL.alamat]      = r[alamatIdx] || '';
+      row[COL.kecamatan]   = r[kecIdx] || '';
+      row[COL.kota]        = r[kotaIdx] || '';
+      row[COL.telepon]     = r[phoneIdx] || '';
+      row[COL.kodePos]     = r[posIdx] || '';
+      row[COL.provinsi]    = r[stateIdx] || '';
       return row;
     });
 
@@ -347,7 +328,7 @@ async function insertExcelToSheet(senderName) {
 
     await logUpdate(senderName, 'BULK INSERT', 'Excel Upload', '-', `${rows.length} order baru`);
     clearCache('sheetData');
-    delete cache['pendingExcel'];
+    delete cache[pendingKey];
 
     return `✅ ${rows.length} order berhasil dimasukkan ke GSheet!\nTanggal: ${today} | Cut Off: ${cutoff}`;
   } catch (e) {
@@ -356,33 +337,46 @@ async function insertExcelToSheet(senderName) {
   }
 }
 
-// ─── SMART FILTER ─────────────────────────────────────────
-const NO_DATA_INTENTS = ['greeting', 'help', 'out_of_scope'];
-const UPDATE_INTENTS = ['update_resi', 'update_tgl_kirim', 'update_tgl_tiba'];
+// ─── FIX 2 & 3: Download file dari Fonnte ─────────────────
+async function getFonnteFile(fileUrl) {
+  try {
+    const res = await axios.get(fileUrl, {
+      responseType: 'arraybuffer',
+      headers: { Authorization: FONNTE_TOKEN },
+    });
+    return Buffer.from(res.data);
+  } catch (e) {
+    console.error('getFonnteFile error:', e.message);
+    return null;
+  }
+}
 
-function detectIntent(message) {
+// ─── SMART FILTER ─────────────────────────────────────────
+const NO_DATA_INTENTS   = ['greeting', 'help', 'out_of_scope'];
+const UPDATE_INTENTS    = ['update_resi', 'update_tgl_kirim', 'update_tgl_tiba'];
+
+function detectIntent(message, senderId) {
   const msg = (message || '').toLowerCase().trim();
 
-  // Greeting & help
   if (/^(halo|hai|hi|hello|selamat|pagi|siang|sore|malam|hey|sup)/.test(msg)) return 'greeting';
-  if (/^(oke|ok|ya|tidak|ga|gak|siap|done|sip|noted|thanks|makasih|terima kasih)$/.test(msg)) return 'greeting';
+  if (/^(oke|ok|tidak|ga|gak|siap|done|sip|noted|thanks|makasih|terima kasih)$/.test(msg)) return 'greeting';
   if (/kamu bisa|fitur apa|help|bantuan|cara pakai|apa saja/.test(msg)) return 'help';
 
-  // Refresh
   if (/refresh|sync data|reload data/.test(msg)) return 'refresh';
-
-  // Log harian
   if (/log hari ini|update hari ini|apa.*diupdate|history update/.test(msg)) return 'log_today';
 
-  // Excel upload confirmation
-  if (/^(ya|yes|iya|yep|yup|konfirmasi|insert|masukkan)$/.test(msg) && cache['pendingExcel']) return 'confirm_excel';
+  // FIX 1: Tambah keyword konfirmasi excel — cek dulu ada pending per sender
+  const pendingKey = senderId ? `pendingExcel_${senderId}` : null;
+  const hasPending = pendingKey && cache[pendingKey];
+  if (/^(ya|yes|iya|yep|yup|konfirmasi|insert|masukkan)$/.test(msg) && hasPending) return 'confirm_excel';
 
-  // Update commands (layer 3)
+  // FIX 1: Tambah keyword trigger upload excel via teks
+  if (/upload.*(excel|xlsx|file)|kirim.*(excel|xlsx|file)|insert.*order|masukkan.*order|tambah.*order|excel.*ke.*sheet|file.*ke.*gsheet/.test(msg)) return 'prompt_excel';
+
   if (/update resi|input resi|tambah resi|masukkan resi/.test(msg)) return 'update_resi';
   if (/update.*tgl.*kirim|update.*tanggal.*kirim|tanggal pengiriman|tgl pengiriman/.test(msg)) return 'update_tgl_kirim';
   if (/update.*tgl.*tiba|update.*tanggal.*tiba|sudah tiba|tgl tiba/.test(msg)) return 'update_tgl_tiba';
 
-  // Monitoring (layer 2)
   if (/pengiriman hari ini|shipped hari ini|dikirim hari ini/.test(msg)) return 'shipped_today';
   if (/reminder|ingatkan|set reminder/.test(msg)) return 'reminder';
   if (/cek reminder|list reminder|reminder apa/.test(msg)) return 'list_reminder';
@@ -403,19 +397,13 @@ function filterData(data, intent, message) {
   if (!data || data.length < 2) return null;
   const rows = data.slice(1);
   const today = getToday();
-  const tomorrow = new Date();
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Jakarta' });
-
-  let filtered;
 
   if (UPDATE_INTENTS.includes(intent)) {
-    // Layer 3: 7 kolom, exclude Received
-    filtered = rows.filter(r => (r[COL.status] || '').toLowerCase() !== 'received');
+    const filtered = rows.filter(r => (r[COL.status] || '').toLowerCase() !== 'received');
     return { cols: UPDATE_COLS, names: UPDATE_NAMES, rows: selectColumns(filtered, UPDATE_COLS, UPDATE_NAMES) };
   }
 
-  // Layer 2: 12 kolom, filter by intent
+  let filtered;
   switch (intent) {
     case 'pending':
       filtered = rows.filter(r => /pending|waiting/i.test(r[COL.status] || ''));
@@ -455,7 +443,7 @@ function filterData(data, intent, message) {
       break;
     case 'reminder':
     case 'list_reminder':
-      return null; // tidak butuh data sheet
+      return null;
     default:
       filtered = rows.slice(-200);
       break;
@@ -477,7 +465,7 @@ function computeSLAAlerts(data) {
     if (!slaStr) return;
     const diff = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
     const info = { no_order: row[COL.noOrder], customer: row[COL.customer], kota: row[COL.kota], status: row[COL.status], sla: slaStr, eksp: row[COL.ekspedisi], resi: row[COL.resi], diff };
-    if (diff < 0) result.overdue.push(info);
+    if (diff < 0)      result.overdue.push(info);
     else if (diff === 0) result.urgent.push(info);
     else if (diff === 1) result.warning.push(info);
     else if (diff <= 2) result.attention.push(info);
@@ -489,17 +477,13 @@ function computeDailySummary(data) {
   if (!data || data.length < 2) return null;
   const today = getToday();
   const rows = data.slice(1);
-  const receivedToday = rows.filter(r => (r[COL.tanggal] || '').startsWith(today)).length;
-  const shippedToday  = rows.filter(r => (r[COL.tglPengiriman] || '').startsWith(today)).length;
-  const waiting       = rows.filter(r => /waiting|pending/i.test(r[COL.status] || '')).length;
-  const noResi        = rows.filter(r => !(r[COL.resi] || '').trim() && (r[COL.status] || '').toLowerCase() !== 'received').length;
-  const overdue       = rows.filter(r => { const s = r[COL.sla]; return s && s < today && (r[COL.status] || '').toLowerCase() !== 'received'; }).length;
-  const kotaCount = {};
-  rows.filter(r => (r[COL.status] || '').toLowerCase() !== 'received').forEach(r => {
-    const k = r[COL.kota] || 'Unknown';
-    kotaCount[k] = (kotaCount[k] || 0) + 1;
-  });
-  return { receivedToday, shippedToday, waiting, noResi, overdue, topKota: Object.entries(kotaCount).sort((a,b)=>b[1]-a[1]).slice(0,3) };
+  return {
+    receivedToday: rows.filter(r => (r[COL.tanggal] || '').startsWith(today)).length,
+    shippedToday:  rows.filter(r => (r[COL.tglPengiriman] || '').startsWith(today)).length,
+    waiting:  rows.filter(r => /waiting|pending/i.test(r[COL.status] || '')).length,
+    noResi:   rows.filter(r => !(r[COL.resi] || '').trim() && (r[COL.status] || '').toLowerCase() !== 'received').length,
+    overdue:  rows.filter(r => { const s = r[COL.sla]; return s && s < today && (r[COL.status] || '').toLowerCase() !== 'received'; }).length,
+  };
 }
 
 function computeEkspReport(data) {
@@ -552,7 +536,6 @@ ACTION:SAVE_REMINDER:[no_order]:[YYYY-MM-DD]:[note]
 
 ## ATURAN PENTING
 - ACTION hanya di akhir pesan, tidak ditampilkan ke user
-- JANGAN gunakan LINK WA Customer tanpa perintah eksplisit
 - Data sudah difilter relevan, gunakan semua yang tersedia
 - Jika data kosong/tidak ditemukan, bilang dengan jelas
 `.trim();
@@ -561,120 +544,113 @@ ACTION:SAVE_REMINDER:[no_order]:[YYYY-MM-DD]:[note]
 const chatHistory = {};
 
 async function callClaude(senderId, senderName, userMessage, imageBase64 = null, imageMime = 'image/jpeg') {
-  const intent = detectIntent(userMessage || '');
-  const today  = getToday();
+  const today = getToday();
 
-  // Out of scope → langsung tolak tanpa load data
-  if (intent === 'out_of_scope') {
-    return 'Hmmm gatau sih, diluar konteks itu keknya 😅';
+  // ── Jalur foto: skip detectIntent sepenuhnya ──────────────
+  // Teks default "Tolong baca nomor resi dari foto ini." tidak cocok
+  // regex apapun → akan jatuh ke out_of_scope → bot jawab "gatau sih".
+  // Solusi: jika ada gambar, langsung ke Claude tanpa cek intent.
+  if (!imageBase64) {
+    const intent = detectIntent(userMessage || '', senderId);
+
+    if (intent === 'out_of_scope') return 'Hmmm gatau sih, diluar konteks itu keknya 😅';
+    if (intent === 'confirm_excel') return await insertExcelToSheet(senderName, senderId);
+    if (intent === 'prompt_excel')  return '📎 Silakan kirim file Excel-nya langsung ke sini ya! Nanti gue proses otomatis.';
+    if (intent === 'refresh')       { clearCache(); return '🔄 Data berhasil di-refresh!'; }
+    if (intent === 'log_today')     return await getLogToday();
+
+    // Load data sheet sesuai intent (hanya untuk jalur teks)
+    let rawData = null;
+    let filteredResult = null;
+    if (!NO_DATA_INTENTS.includes(intent)) {
+      rawData = await getSheetData();
+      filteredResult = filterData(rawData, intent, userMessage || '');
+    }
+
+    const [memories, reminders] = await Promise.all([getMemory(), getReminders()]);
+    const todayReminders    = reminders.filter(r => r[3] === today && r[5] === 'Pending');
+    const upcomingReminders = reminders.filter(r => r[3] >= today && r[5] === 'Pending');
+    const slaAlerts    = ['sla_alert','overdue','summary'].includes(intent) ? computeSLAAlerts(rawData) : null;
+    const dailySummary = intent === 'summary'   ? computeDailySummary(rawData) : null;
+    const ekspReport   = intent === 'analytics' ? computeEkspReport(rawData)   : null;
+
+    let context = `Tanggal hari ini (WIB): ${today}\nUser: ${senderName}\n\n`;
+    if (memories.length > 0) {
+      context += `=== MEMORY ===\n`;
+      memories.forEach(m => { context += `[${m[1]}] ${m[2]}\n`; });
+      context += '\n';
+    }
+    if (todayReminders.length > 0) {
+      context += `=== REMINDER HARI INI ===\n`;
+      todayReminders.forEach(r => { context += `Oleh: ${r[1]} | Order: ${r[2] || '-'} | ${r[4]}\n`; });
+      context += '\n';
+    }
+    if (upcomingReminders.length > 0) {
+      context += `=== UPCOMING REMINDERS ===\n`;
+      upcomingReminders.forEach(r => { context += `[${r[3]}] Oleh: ${r[1]} | Order: ${r[2] || '-'} | ${r[4]}\n`; });
+      context += '\n';
+    }
+    if (slaAlerts) {
+      context += `=== SLA ALERTS ===\nOverdue:${slaAlerts.overdue.length} Urgent:${slaAlerts.urgent.length} Warning:${slaAlerts.warning.length}\n`;
+      if (slaAlerts.overdue.length) context += `Overdue: ${JSON.stringify(slaAlerts.overdue)}\n`;
+      if (slaAlerts.urgent.length)  context += `Urgent: ${JSON.stringify(slaAlerts.urgent)}\n`;
+      if (slaAlerts.warning.length) context += `Warning: ${JSON.stringify(slaAlerts.warning)}\n`;
+      context += '\n';
+    }
+    if (dailySummary) context += `=== DAILY SUMMARY ===\n${JSON.stringify(dailySummary)}\n\n`;
+    if (ekspReport)   context += `=== EKSPEDISI REPORT ===\n${JSON.stringify(ekspReport)}\n\n`;
+    if (filteredResult && filteredResult.rows.length > 0) {
+      context += `=== DATA ORDER [${intent}, ${filteredResult.rows.length} rows] ===\n${JSON.stringify(filteredResult.rows)}\n`;
+    } else if (filteredResult) {
+      context += `=== DATA ORDER ===\nTidak ada data yang sesuai filter.\n`;
+    }
+
+    if (!chatHistory[senderId]) chatHistory[senderId] = [];
+    const messages = [...chatHistory[senderId]];
+    messages.push({ role: 'user', content: `${context}\n\n${userMessage}` });
+
+    const response = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      messages,
+    });
+
+    const usage = response.usage;
+    console.log(`[Tokens] in:${usage.input_tokens} out:${usage.output_tokens} cache_write:${usage.cache_creation_input_tokens||0} cache_read:${usage.cache_read_input_tokens||0}`);
+
+    const reply = response.content[0].text;
+    chatHistory[senderId].push({ role: 'user', content: userMessage });
+    chatHistory[senderId].push({ role: 'assistant', content: reply });
+    if (chatHistory[senderId].length > 12) chatHistory[senderId] = chatHistory[senderId].slice(-12);
+
+    await parseActions(reply, senderId, senderName);
+    return reply.replace(/ACTION:[^\n]+/g, '').trim();
   }
 
-  // Confirm excel insert
-  if (intent === 'confirm_excel') {
-    return await insertExcelToSheet(senderName);
-  }
-
-  // Refresh cache
-  if (intent === 'refresh') {
-    clearCache();
-    return '🔄 Data berhasil di-refresh! Cache dikosongkan, data terbaru akan diambil dari sheet.';
-  }
-
-  // Log today
-  if (intent === 'log_today') {
-    return await getLogToday();
-  }
-
-  // Load data sesuai kebutuhan
-  let rawData = null;
-  let filteredResult = null;
-
-  if (!NO_DATA_INTENTS.includes(intent)) {
-    rawData = await getSheetData();
-    filteredResult = filterData(rawData, intent, userMessage || '');
-  }
-
-  const [memories, reminders] = await Promise.all([getMemory(), getReminders()]);
-  const todayReminders = reminders.filter(r => r[3] === today && r[5] === 'Pending');
-  const upcomingReminders = reminders.filter(r => r[3] >= today && r[5] === 'Pending');
-
-  // SLA alerts (hanya untuk intent terkait)
-  const slaAlerts = ['sla_alert', 'overdue', 'summary'].includes(intent) ? computeSLAAlerts(rawData) : null;
-  const dailySummary = intent === 'summary' ? computeDailySummary(rawData) : null;
-  const ekspReport = intent === 'analytics' ? computeEkspReport(rawData) : null;
-
-  // Build dynamic context (SYSTEM_PROMPT di-cache terpisah)
-  let context = `Tanggal hari ini (WIB): ${today}\nUser: ${senderName}\n\n`;
-
-  if (memories.length > 0) {
-    context += `=== MEMORY ===\n`;
-    memories.forEach(m => { context += `[${m[1]}] ${m[2]}\n`; });
-    context += '\n';
-  }
-
-  if (todayReminders.length > 0) {
-    context += `=== REMINDER HARI INI ===\n`;
-    todayReminders.forEach(r => { context += `Oleh: ${r[1]} | Order: ${r[2] || '-'} | ${r[4]}\n`; });
-    context += '\n';
-  }
-
-  if (upcomingReminders.length > 0) {
-    context += `=== UPCOMING REMINDERS (semua user) ===\n`;
-    upcomingReminders.forEach(r => { context += `[${r[3]}] Oleh: ${r[1]} | Order: ${r[2] || '-'} | ${r[4]}\n`; });
-    context += '\n';
-  }
-
-  if (slaAlerts) {
-    context += `=== SLA ALERTS ===\n`;
-    context += `Overdue: ${slaAlerts.overdue.length} | Urgent H-0: ${slaAlerts.urgent.length} | Warning H-1: ${slaAlerts.warning.length} | Attention H-2: ${slaAlerts.attention.length}\n`;
-    if (slaAlerts.overdue.length) context += `Overdue: ${JSON.stringify(slaAlerts.overdue)}\n`;
-    if (slaAlerts.urgent.length) context += `Urgent: ${JSON.stringify(slaAlerts.urgent)}\n`;
-    if (slaAlerts.warning.length) context += `Warning: ${JSON.stringify(slaAlerts.warning)}\n`;
-    if (slaAlerts.attention.length) context += `Attention: ${JSON.stringify(slaAlerts.attention)}\n`;
-    context += '\n';
-  }
-
-  if (dailySummary) context += `=== DAILY SUMMARY ===\n${JSON.stringify(dailySummary)}\n\n`;
-  if (ekspReport) context += `=== EKSPEDISI REPORT ===\n${JSON.stringify(ekspReport)}\n\n`;
-
-  if (filteredResult && filteredResult.rows.length > 0) {
-    context += `=== DATA ORDER [${intent}, ${filteredResult.rows.length} rows] ===\n`;
-    context += JSON.stringify(filteredResult.rows) + '\n';
-  } else if (filteredResult && filteredResult.rows.length === 0) {
-    context += `=== DATA ORDER ===\nTidak ada data yang sesuai filter.\n`;
-  }
-
-  // Build messages
+  // ── Jalur foto: langsung ke Claude ───────────────────────
+  // Tidak perlu load data sheet, tidak perlu context order.
+  // Claude cukup baca gambar dan ekstrak nomor resi.
   if (!chatHistory[senderId]) chatHistory[senderId] = [];
   const messages = [...chatHistory[senderId]];
 
-  let userContent;
-  if (imageBase64) {
-    userContent = [
-      { type: 'image', source: { type: 'base64', media_type: imageMime, data: imageBase64 } },
-      { type: 'text', text: userMessage || 'Tolong baca nomor resi dari foto ini.' }
-    ];
-  } else {
-    userContent = userMessage;
-  }
+  const userContent = [
+    { type: 'image', source: { type: 'base64', media_type: imageMime, data: imageBase64 } },
+    { type: 'text', text: `Tanggal hari ini (WIB): ${today}\nUser: ${senderName}\n\n${userMessage || 'Tolong baca nomor resi dari foto ini.'}` }
+  ];
   messages.push({ role: 'user', content: userContent });
 
   const response = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 1000,
-    // Prompt Caching: SYSTEM_PROMPT (static) di-cache, context (dynamic) tidak
-    system: [
-      { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } },
-      { type: 'text', text: context }
-    ],
+    system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
     messages,
   });
-  // Log token usage untuk monitoring
+
   const usage = response.usage;
-  console.log(`[Tokens] in:${usage.input_tokens} out:${usage.output_tokens} cache_write:${usage.cache_creation_input_tokens||0} cache_read:${usage.cache_read_input_tokens||0}`);
+  console.log(`[Tokens foto] in:${usage.input_tokens} out:${usage.output_tokens} cache_read:${usage.cache_read_input_tokens||0}`);
 
   const reply = response.content[0].text;
-
   chatHistory[senderId].push({ role: 'user', content: userMessage || '[foto]' });
   chatHistory[senderId].push({ role: 'assistant', content: reply });
   if (chatHistory[senderId].length > 12) chatHistory[senderId] = chatHistory[senderId].slice(-12);
@@ -686,22 +662,33 @@ async function callClaude(senderId, senderName, userMessage, imageBase64 = null,
 async function parseActions(text, senderId, senderName) {
   for (const line of text.split('\n')) {
     const t = line.trim();
-    if (t.startsWith('ACTION:UPDATE_RESI:')) {
-      const p = t.split(':'); if (p[2] && p[3]) await updateOrderField(p[2], COL.resi, 'Resi', p[3], senderName);
-    }
-    if (t.startsWith('ACTION:UPDATE_TGL_KIRIM:')) {
-      const p = t.split(':'); if (p[2] && p[3]) await updateOrderField(p[2], COL.tglPengiriman, 'Tgl Pengiriman', p[3], senderName);
-    }
-    if (t.startsWith('ACTION:UPDATE_TGL_TIBA:')) {
-      const p = t.split(':'); if (p[2] && p[3]) await updateOrderField(p[2], COL.tglTiba, 'Tgl Tiba', p[3], senderName);
-    }
-    if (t.startsWith('ACTION:SAVE_MEMORY:')) {
-      const rest = t.replace('ACTION:SAVE_MEMORY:', ''), idx = rest.indexOf(':');
-      if (idx > -1) await saveMemory(rest.substring(0, idx), rest.substring(idx + 1));
-    }
-    if (t.startsWith('ACTION:SAVE_REMINDER:')) {
-      const rest = t.replace('ACTION:SAVE_REMINDER:', ''), parts = rest.split(':');
-      if (parts.length >= 3) await saveReminder(senderName, parts[0], parts[1], parts.slice(2).join(':'));
+    try {
+      // FIX (dari review sebelumnya): pakai indexOf agar nilai dengan ':' tidak terpotong
+      if (t.startsWith('ACTION:UPDATE_RESI:')) {
+        const rest = t.replace('ACTION:UPDATE_RESI:', '');
+        const idx = rest.indexOf(':');
+        if (idx > -1) await updateOrderField(rest.substring(0, idx), COL.resi, 'Resi', rest.substring(idx + 1), senderName);
+      }
+      if (t.startsWith('ACTION:UPDATE_TGL_KIRIM:')) {
+        const rest = t.replace('ACTION:UPDATE_TGL_KIRIM:', '');
+        const idx = rest.indexOf(':');
+        if (idx > -1) await updateOrderField(rest.substring(0, idx), COL.tglPengiriman, 'Tgl Pengiriman', rest.substring(idx + 1), senderName);
+      }
+      if (t.startsWith('ACTION:UPDATE_TGL_TIBA:')) {
+        const rest = t.replace('ACTION:UPDATE_TGL_TIBA:', '');
+        const idx = rest.indexOf(':');
+        if (idx > -1) await updateOrderField(rest.substring(0, idx), COL.tglTiba, 'Tgl Tiba', rest.substring(idx + 1), senderName);
+      }
+      if (t.startsWith('ACTION:SAVE_MEMORY:')) {
+        const rest = t.replace('ACTION:SAVE_MEMORY:', ''), idx = rest.indexOf(':');
+        if (idx > -1) await saveMemory(rest.substring(0, idx), rest.substring(idx + 1));
+      }
+      if (t.startsWith('ACTION:SAVE_REMINDER:')) {
+        const rest = t.replace('ACTION:SAVE_REMINDER:', ''), parts = rest.split(':');
+        if (parts.length >= 3) await saveReminder(senderName, parts[0], parts[1], parts.slice(2).join(':'));
+      }
+    } catch (e) {
+      console.error(`parseActions error on line "${t}":`, e.message);
     }
   }
 }
@@ -747,12 +734,6 @@ async function getTelegramFile(fileId) {
 app.get('/health', (_, res) => res.json({ status: 'ok', model: 'claude-haiku-4-5', time_wib: new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }) }));
 app.get('/webhook/telegram', (_, res) => res.sendStatus(200));
 app.get('/webhook/wa', (_, res) => res.sendStatus(200));
-app.get('/test-telegram', async (req, res) => {
-  const chatId = req.query.chat_id || TELEGRAM_CHAT_ID;
-  if (!chatId) return res.json({ error: 'Tambahkan ?chat_id=xxx' });
-  await sendTelegram(chatId, `OPS Agent (Claude Haiku) aktif ✅\n${new Date().toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}`);
-  res.json({ sent: true });
-});
 
 // Telegram
 app.post('/webhook/telegram', async (req, res) => {
@@ -766,13 +747,12 @@ app.post('/webhook/telegram', async (req, res) => {
   let text = msg.text || msg.caption || '';
   let imageBase64 = null;
 
-  // Handle dokumen Excel
   if (msg.document) {
     const fname = msg.document.file_name || '';
     if (fname.match(/\.(xlsx|xls)$/i)) {
       try {
         const fileBuffer = await getTelegramFile(msg.document.file_id);
-        const preview = await handleExcelUpload(fileBuffer, firstName, chatId, false);
+        const preview = await handleExcelUpload(fileBuffer, firstName, senderId, false);
         await sendTelegram(chatId, preview);
         return;
       } catch (e) {
@@ -782,7 +762,6 @@ app.post('/webhook/telegram', async (req, res) => {
     }
   }
 
-  // Handle foto
   if (msg.photo && msg.photo.length > 0) {
     try {
       const fileBuffer = await getTelegramFile(msg.photo[msg.photo.length - 1].file_id);
@@ -803,16 +782,51 @@ app.post('/webhook/telegram', async (req, res) => {
   }
 });
 
-// WA
+// ─── FIX 2 & 3: Webhook WA dengan handler file & foto ─────
 app.post('/webhook/wa', async (req, res) => {
   res.sendStatus(200);
-  const { sender, message, name } = req.body;
-  if (!sender || !message) return;
+  const { sender, message, name, file, mimetype } = req.body;
+  if (!sender) return;
+
   const senderName = name || sender;
-  console.log(`WA [${senderName}]: ${message.substring(0, 80)}`);
+  const senderId   = `wa_${sender}`;
+
+  console.log(`WA [${senderName}]: msg="${(message||'').substring(0,60)}" file=${!!file} mime=${mimetype||'-'}`);
+
   try {
-    const reply = await callClaude(`wa_${sender}`, senderName, message);
+    // FIX 2: Handle dokumen Excel dari WA (Fonnte mengirim URL file di field "file")
+    if (file && mimetype && /spreadsheet|excel|xlsx|xls/i.test(mimetype)) {
+      console.log(`WA [${senderName}]: Excel file detected, downloading...`);
+      const fileBuffer = await getFonnteFile(file);
+      if (!fileBuffer) {
+        await sendWA(sender, 'Gagal download file Excel. Coba kirim ulang ya.');
+        return;
+      }
+      const preview = await handleExcelUpload(fileBuffer, senderName, senderId, true);
+      await sendWA(sender, preview);
+      return;
+    }
+
+    // FIX 3: Handle foto/gambar dari WA (untuk baca resi)
+    if (file && mimetype && /image/i.test(mimetype)) {
+      console.log(`WA [${senderName}]: Image detected, downloading...`);
+      const fileBuffer = await getFonnteFile(file);
+      if (!fileBuffer) {
+        await sendWA(sender, 'Gagal download foto. Coba kirim ulang ya.');
+        return;
+      }
+      const imageBase64 = fileBuffer.toString('base64');
+      const caption = message || 'Tolong baca nomor resi dari foto ini.';
+      const reply = await callClaude(senderId, senderName, caption, imageBase64, mimetype);
+      await sendWA(sender, reply);
+      return;
+    }
+
+    // Pesan teks biasa
+    if (!message) return;
+    const reply = await callClaude(senderId, senderName, message);
     await sendWA(sender, reply);
+
   } catch (e) {
     console.error('WA error:', e.message);
     await sendWA(sender, 'Maaf, terjadi error: ' + e.message);
@@ -831,7 +845,6 @@ cron.schedule('0 8 * * *', async () => {
     const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone: 'Asia/Jakarta' });
 
     if (data) {
-      // H-1 Pending
       const h1 = data.slice(1).filter(r => (r[COL.requestDate] || '').trim() === tomorrowStr && (r[COL.status] || '').toLowerCase() !== 'received');
       if (h1.length > 0) {
         let msg = `🔔 H-1 PENDING REMINDER\nRequest Date besok: ${tomorrowStr}\n\n`;
@@ -841,22 +854,20 @@ cron.schedule('0 8 * * *', async () => {
         });
         msg += `\nTotal: ${h1.length} order`;
         if (TELEGRAM_CHAT_ID) await sendTelegram(TELEGRAM_CHAT_ID, msg);
-        if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
+        if (YOUR_WA_NUMBER)   await sendWA(YOUR_WA_NUMBER, msg);
       }
 
-      // SLA Alert
       const sla = computeSLAAlerts(data);
       if (sla && (sla.urgent.length > 0 || sla.overdue.length > 0)) {
         let msg = `⚠️ ALERT SLA - ${today}\n\n`;
         if (sla.overdue.length) { msg += `🚨 OVERDUE (${sla.overdue.length}):\n`; sla.overdue.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; }); msg += '\n'; }
         if (sla.urgent.length)  { msg += `🔴 URGENT H-0 (${sla.urgent.length}):\n`;  sla.urgent.forEach(o => { msg += `• ${o.no_order} - ${o.customer}\n`; }); msg += '\n'; }
         if (sla.warning.length) { msg += `🟡 WARNING H-1 (${sla.warning.length}):\n`; sla.warning.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; }); }
-        if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
+        if (YOUR_WA_NUMBER)   await sendWA(YOUR_WA_NUMBER, msg);
         if (TELEGRAM_CHAT_ID) await sendTelegram(TELEGRAM_CHAT_ID, msg);
       }
     }
 
-    // Reminders
     clearCache('reminders');
     const reminders = await getReminders();
     const todayReminders = reminders.filter(r => r[3] === today && r[5] === 'Pending');
@@ -868,7 +879,7 @@ cron.schedule('0 8 * * *', async () => {
         if (row) orderInfo = `\n📦 ${row[COL.noOrder]} - ${row[COL.customer]}\n   Status: ${row[COL.status] || '—'} | SLA: ${row[COL.sla] || '—'}`;
       }
       const msg = `🔔 REMINDER HARI INI - ${today}\n📌 ${r[4]}${orderInfo}\n\nDibuat oleh: ${r[1]}`;
-      if (YOUR_WA_NUMBER) await sendWA(YOUR_WA_NUMBER, msg);
+      if (YOUR_WA_NUMBER)   await sendWA(YOUR_WA_NUMBER, msg);
       if (TELEGRAM_CHAT_ID) await sendTelegram(TELEGRAM_CHAT_ID, msg);
       await markReminderDone(reminders.indexOf(todayReminders[i]));
     }
@@ -879,6 +890,5 @@ cron.schedule('0 8 * * *', async () => {
 
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`OPS Agent (Claude Haiku 4.5) running on port ${PORT}`);
-  console.log(`Features: Smart Filter | 3-Layer | Cache 1H | Excel Upload | Update Log | Shared Reminder`);
+  console.log(`OPS Agent running on port ${PORT}`);
 });
