@@ -21,6 +21,7 @@ const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_NOTIF_CHAT_ID;
 const YOUR_WA_NUMBER     = process.env.YOUR_WA_NUMBER;
 const GROUP_WA_ID        = process.env.GROUP_WA_ID;
 const BOT_MENTION        = (process.env.BOT_MENTION_NAME || 'Nyenyenye').toLowerCase();
+const BOT_WA_NUMBER      = process.env.BOT_WA_NUMBER || '';
 const REMINDER_TARGETS   = (process.env.REMINDER_TARGETS || '').split(',').filter(Boolean);
 const PORT               = process.env.PORT || 3000;
 
@@ -784,7 +785,10 @@ app.post('/webhook/wa', async (req, res) => {
     // GROUP MESSAGE
     if (isGroup) {
       if (!message) return;
-      if (!message.toLowerCase().includes(`@${BOT_MENTION}`)) return; // abaikan jika tidak mention bot
+      // Deteksi mention: via teks @Nyenyenye ATAU via WA proper mention @628xxx
+      const isMentioned = message.toLowerCase().includes(`@${BOT_MENTION}`) ||
+                          (BOT_WA_NUMBER && message.includes(`@${BOT_WA_NUMBER}`));
+      if (!isMentioned) return;
       await handleGroupMessage(sender, message, senderName);
       return;
     }
