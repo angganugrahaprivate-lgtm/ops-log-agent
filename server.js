@@ -678,12 +678,52 @@ async function getTelegramFile(fileId) {
   return Buffer.from(res.data);
 }
 
+// ─── HELPER: CEK MENTION BOT ──────────────────────────────
+// FIX: WhatsApp grup mengirim mention sebagai @nomor (bukan @nama),
+// dan formatnya bisa beda (dengan/tanpa kode negara 62).
+function isBotMentioned(message) {
+  const msg = message || '';
+  const msgLower = msg.toLowerCase();
+
+  // Cek berdasarkan nama mention (misal @nyenyenye)
+  if (msgLower.includes(`@${BOT_MENTION}`)) return true;
+
+  // Cek berdasarkan nomor bot dengan berbagai format
+  if (BOT_WA_NUMBER) {
+    const num = BOT_WA_NUMBER.replace(/\D/g, ''); // bersihkan non-digit
+    const variants = [
+      num,                              // 62896535262261
+      num.replace(/^62/, '0'),          // 0896535262261
+      num.replace(/^62/, ''),           // 896535262261
+      num.replace(/^0/, '62'),          // pastikan 62xxx juga dicek
+    ];
+    for (const v of variants) {
+      if (v && msg.includes(`@${v}`)) return true;
+    }
+  }
+
+  return false;
+}
+
 // ─── GROUP WA HANDLER ─────────────────────────────────────
 async function handleGroupMessage(groupId, rawMessage, senderName, senderPhone) {
-  const cleanMsg = rawMessage
-    .replace(new RegExp(`@${BOT_MENTION}`, 'gi'), '')
-    .replace(BOT_WA_NUMBER ? new RegExp(`@${BOT_WA_NUMBER}`, 'g') : /(?!)/g, '')
-    .trim();
+  // Bersihkan semua variasi mention bot dari pesan
+  let cleanMsg = rawMessage
+    .replace(new RegExp(`@${BOT_MENTION}`, 'gi'), '');
+
+  if (BOT_WA_NUMBER) {
+    const num = BOT_WA_NUMBER.replace(/\D/g, '');
+    const variants = [
+      num,
+      num.replace(/^62/, '0'),
+      num.replace(/^62/, ''),
+    ];
+    for (const v of variants) {
+      if (v) cleanMsg = cleanMsg.replace(new RegExp(`@${v}`, 'g'), '');
+    }
+  }
+  cleanMsg = cleanMsg.trim();
+
   console.log(`Group [${senderName}]: ${cleanMsg.substring(0, 80)}`);
 
   // Mention balik user yang manggil
@@ -805,9 +845,8 @@ app.post('/webhook/wa', async (req, res) => {
     // GROUP MESSAGE
     if (isGroup) {
       if (!message) return;
-      const isMentioned = message.toLowerCase().includes(`@${BOT_MENTION}`) ||
-                          (BOT_WA_NUMBER && message.includes(`@${BOT_WA_NUMBER}`));
-      if (!isMentioned) return;
+      // FIX: gunakan helper isBotMentioned() yang handle semua format nomor
+      if (!isBotMentioned(message)) return;
       await handleGroupMessage(sender, message, senderName, senderPhone);
       return;
     }
