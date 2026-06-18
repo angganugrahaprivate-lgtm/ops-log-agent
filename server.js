@@ -408,6 +408,9 @@ function detectIntent(message, senderId) {
   if (/pengiriman hari ini|shipped hari ini|dikirim hari ini/.test(msg)) return 'shipped_today';
   if (/^(reminder|ingatkan|set reminder)/.test(msg)) return 'reminder';
   if (/cek reminder|list reminder|reminder apa/.test(msg)) return 'list_reminder';
+  if (/resi.*diterima.*hari ini|diterima.*hari ini|delivered.*hari ini/.test(msg)) return 'jt_diterima';
+  if (/resi.*berisiko|berisiko.*telat|mau.*telat/.test(msg)) return 'jt_berisiko';
+  if (/resi.*telat|telat.*resi|overdue.*resi/.test(msg)) return 'jt_overdue';
   if (/overdue|telat|terlambat|lewat sla/.test(msg)) return 'overdue';
   if (/sla|deadline|mau deadline|mendekati|urgent/.test(msg)) return 'sla_alert';
   if (/pending|waiting|belum dikirim/.test(msg)) return 'pending';
@@ -819,6 +822,10 @@ app.post('/webhook/telegram', async (req, res) => {
       if (result.msg2) await sendTelegram(chatId, result.msg2);
       return;
     }
+    if (intent === 'dryrun_jt') { runDryRunWA(String(chatId)).catch(console.error); return; }
+    if (intent === 'jt_diterima') { getJTDiterima(chatId, false).catch(console.error); return; }
+    if (intent === 'jt_berisiko') { getJTBerisiko(chatId, false).catch(console.error); return; }
+    if (intent === 'jt_overdue')  { getJTOverdue(chatId, false).catch(console.error);  return; }
     await sendTelegram(chatId, await callClaude(senderId, firstName, text, imageBase64));
   } catch (e) { console.error('TG error:', e.message); await sendTelegram(chatId, 'Maaf, error: ' + e.message); }
 });
@@ -872,13 +879,17 @@ app.post('/webhook/wa', async (req, res) => {
 
     // PRIVATE - Dry run J&T
     if (intent === 'dryrun_jt') {
-      await sendWA(sender, '⏳ Dry run J&T dimulai...\nHasilnya dikirim bertahap, tunggu sebentar ya.');
       runDryRunWA(sender).catch(e => {
         console.error('runDryRunWA error:', e.message);
         sendWA(sender, '❌ Error saat dry run: ' + e.message);
       });
       return;
     }
+
+    // PRIVATE - On-demand J&T tracking
+    if (intent === 'jt_diterima') { getJTDiterima(sender, true).catch(console.error); return; }
+    if (intent === 'jt_berisiko') { getJTBerisiko(sender, true).catch(console.error); return; }
+    if (intent === 'jt_overdue')  { getJTOverdue(sender, true).catch(console.error);  return; }
 
     // PRIVATE - Teks biasa
     await sendWA(sender, await callClaude(senderId, senderName, message));
@@ -1049,6 +1060,137 @@ async function analisaSLAJTCargo(orderInfo, trackingData) {
 }
 
 // ─── DAILY TRACKING REPORT ────────────────────────────────
+
+// ─── ON-DEMAND HANDLER: Diterima Hari Ini ────────────────
+async function getJTDiterima(target, isWA) {
+  try {
+    const data = await getSheetData();
+    if (!data) return;
+    const today = getToday();
+    const rows  = data.slice(1).filter(r =>
+      (r[COL.ekspedisi] || '').match(/j[n&]t\s*cargo/i) &&
+      (r[COL.resi]      || '').trim() &&
+      !['delivered', 'received', 'return'].includes((r[COL.status] || '').toLowerCase())
+    );
+    const diterima = [];
+    for (const row of rows) {
+      await new Promise(r => setTimeout(r, 600));
+      const result = await cekResiJTCargo((row[COL.resi] || '').trim());
+      if (!result.ok || !result.isDelivered) continue;
+      if (result.updateTerakhir.split(' ')[0] !== today) continue;
+      diterima.push(
+        `✅ ${row[COL.shippingNum] || '-'}\n` +
+        `   👤 ${row[COL.customer] || '-'}\n` +
+        `   📍 ${result.posisi}\n` +
+        `   📅 ${result.updateTerakhir}`
+      );
+    }
+    const msg = diterima.length
+      ? `✅ *DITERIMA HARI INI — ${diterima.length} resi*\n\n` + diterima.join('\n\n')
+      : `✅ Belum ada resi J&T yang diterima hari ini.`;
+    isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
+  } catch (e) {
+    console.error('getJTDiterima error:', e.message);
+    isWA ? await sendWA(target, '❌ Gagal: ' + e.message) : await sendTelegram(target, '❌ Gagal: ' + e.message);
+  }
+}
+
+// ─── ON-DEMAND HANDLER: Berisiko Telat ───────────────────
+async function getJTBerisiko(target, isWA) {
+  try {
+    const data = await getSheetData();
+    if (!data) return;
+    const today = getToday();
+    const rows  = data.slice(1).filter(r => {
+      if (!(r[COL.ekspedisi] || '').match(/j[n&]t\s*cargo/i)) return false;
+      if (!(r[COL.resi]      || '').trim()) return false;
+      if (['delivered', 'received', 'return'].includes((r[COL.status] || '').toLowerCase())) return false;
+      const slaStr = (r[COL.sla] || '').trim();
+      if (!slaStr) return false;
+      const sisaSLA = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
+      return sisaSLA >= 0 && sisaSLA <= 1;
+    });
+    if (!rows.length) {
+      const msg = `⚠️ Tidak ada resi J&T yang berisiko telat saat ini.`;
+      isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
+      return;
+    }
+    const berisiko = [];
+    for (const row of rows) {
+      const slaStr    = (row[COL.sla]           || '').trim();
+      const tglKirim  = parseDate((row[COL.tglPengiriman] || '').trim());
+      const sisaSLA   = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
+      const hariJalan = tglKirim ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000) : 0;
+      await new Promise(r => setTimeout(r, 600));
+      const result = await cekResiJTCargo((row[COL.resi] || '').trim());
+      if (!result.ok || result.isDelivered) continue;
+      const orderInfo = {
+        hariJalan,
+        sla    : slaStr && tglKirim ? Math.round((new Date(slaStr) - new Date(tglKirim)) / 86400000) : '-',
+        sisaSLA,
+      };
+      const analisa = await analisaSLAJTCargo(orderInfo, result);
+      berisiko.push(
+        `⚠️ ${row[COL.shippingNum] || '-'}\n` +
+        `   👤 ${row[COL.customer] || '-'}\n` +
+        `   📍 ${result.posisi}\n` +
+        `   ⏱️ Sisa SLA: *${sisaSLA} hari* | Jalan: ${hariJalan} hari\n` +
+        `   🤖 ${analisa}`
+      );
+    }
+    const msg = berisiko.length
+      ? `⚠️ *BERISIKO TELAT — ${berisiko.length} resi*\n\n` + berisiko.join('\n\n')
+      : `⚠️ Semua resi J&T yang hampir SLA sudah diterima.`;
+    isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
+  } catch (e) {
+    console.error('getJTBerisiko error:', e.message);
+    isWA ? await sendWA(target, '❌ Gagal: ' + e.message) : await sendTelegram(target, '❌ Gagal: ' + e.message);
+  }
+}
+
+// ─── ON-DEMAND HANDLER: Overdue (dari sheet, no API) ─────
+async function getJTOverdue(target, isWA) {
+  try {
+    const data = await getSheetData();
+    if (!data) return;
+    const today = getToday();
+    const rows  = data.slice(1).filter(r => {
+      if (!(r[COL.ekspedisi] || '').match(/j[n&]t\s*cargo/i)) return false;
+      if (['delivered', 'received', 'return'].includes((r[COL.status] || '').toLowerCase())) return false;
+      const slaStr = (r[COL.sla] || '').trim();
+      if (!slaStr) return false;
+      return Math.round((new Date(slaStr) - new Date(today)) / 86400000) < 0;
+    });
+    if (!rows.length) {
+      const msg = `🔴 Tidak ada resi J&T yang lewat SLA.`;
+      isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
+      return;
+    }
+    const list = rows
+      .map(r => {
+        const slaStr    = (r[COL.sla] || '').trim();
+        const tglKirim  = parseDate((r[COL.tglPengiriman] || '').trim());
+        const sisaSLA   = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
+        const hariJalan = tglKirim ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000) : '?';
+        return {
+          text:
+            `🔴 ${r[COL.shippingNum] || '-'}\n` +
+            `   👤 ${r[COL.customer] || '-'} | 📍 ${r[COL.kota] || '-'}\n` +
+            `   ⏱️ Telat *${Math.abs(sisaSLA)} hari* | Jalan: ${hariJalan} hari\n` +
+            `   📊 Status: ${r[COL.status] || '-'}`,
+          telat: Math.abs(sisaSLA),
+        };
+      })
+      .sort((a, b) => b.telat - a.telat)
+      .map(x => x.text);
+    const msg = `🔴 *SUDAH LEWAT SLA — ${list.length} resi*\n\n` + list.join('\n\n');
+    isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
+  } catch (e) {
+    console.error('getJTOverdue error:', e.message);
+    isWA ? await sendWA(target, '❌ Gagal: ' + e.message) : await sendTelegram(target, '❌ Gagal: ' + e.message);
+  }
+}
+
 async function dailyJTTrackingReport() {
   console.log('=== SCHEDULER 07:05 WIB — J&T Tracking Report ===');
   try {
@@ -1244,12 +1386,6 @@ async function runDryRunWA(waTarget) {
         : null;
 
       totalPantau++;
-
-      // Progress update setiap 5 resi
-      if (totalPantau % 5 === 0) {
-        await sendWA(waTarget, `⏳ Memproses resi ke-${totalPantau}...`);
-      }
-
       await new Promise(r => setTimeout(r, 600));
 
       console.log(`[DRY RUN WA] Cek resi [${totalPantau}]: ${resi} (${customer})`);
@@ -1277,8 +1413,8 @@ async function runDryRunWA(waTarget) {
       }
     }
 
-    // Kirim summary
-    await sendWA(waTarget,
+    // Kirim 1 pesan ringkasan
+    let msg =
       `🧪 *DRY RUN SELESAI*\n` +
       `📅 ${formatDateID(today)}\n` +
       `━━━━━━━━━━━━━━━\n` +
@@ -1289,19 +1425,14 @@ async function runDryRunWA(waTarget) {
       `❌ Error     : *${errors.length}*\n` +
       `⏭️ Skip      : *${skipped.length}*\n` +
       `━━━━━━━━━━━━━━━\n` +
-      `_Sheet tidak diubah_`
-    );
+      `_Sheet tidak diubah_\n\n`;
 
-    if (diterima.length) await sendWA(waTarget, `✅ *DITERIMA (${diterima.length})*\n\n` + diterima.join('\n\n'));
-    if (berisiko.length) await sendWA(waTarget, `⚠️ *BERISIKO TELAT (${berisiko.length})*\n\n` + berisiko.join('\n\n'));
-    if (overdue.length)  await sendWA(waTarget, `🔴 *SUDAH LEWAT SLA (${overdue.length})*\n\n` + overdue.join('\n\n'));
-    if (errors.length)   await sendWA(waTarget, `❌ *GAGAL CEK (${errors.length})*\n\n` + errors.join('\n\n'));
+    if (diterima.length) msg += `✅ *DITERIMA:*\n` + diterima.join('\n') + '\n\n';
+    if (berisiko.length) msg += `⚠️ *BERISIKO:*\n` + berisiko.join('\n') + '\n\n';
+    if (overdue.length)  msg += `🔴 *OVERDUE:*\n`  + overdue.join('\n')  + '\n\n';
+    if (errors.length)   msg += `❌ *GAGAL CEK:*\n` + errors.join('\n');
 
-    if (skipped.length) {
-      const preview = skipped.slice(0, 15).join('\n');
-      const more    = skipped.length > 15 ? `\n...+${skipped.length - 15} lainnya` : '';
-      await sendWA(waTarget, `⏭️ *SKIP (${skipped.length})*\n\n${preview}${more}`);
-    }
+    await sendWA(waTarget, msg);
 
   } catch (e) {
     console.error('runDryRunWA error:', e.message);
