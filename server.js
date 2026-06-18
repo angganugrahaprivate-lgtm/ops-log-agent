@@ -944,7 +944,310 @@ cron.schedule('0 7 * * *', async () => {
     console.log(`H-0 reminders sent: ${todayR.length}`);
   } catch (e) { console.error('Scheduler 07:00 error:', e.message); }
 }, { timezone:'Asia/Jakarta' });
+// ═══════════════════════════════════════════════════════════
+//  PATCH: J&T CARGO TRACKING + DAILY REPORT
+//  Tambahkan kode ini ke server.js SEBELUM baris app.listen()
+//  Version: 1.0
+// ═══════════════════════════════════════════════════════════
 
+// ─── J&T CARGO API ────────────────────────────────────────
+const JT_BASE          = 'https://office.jtcargo.co.id/official/waybill/';
+const JT_VALIDATE_CODE = '6251';
+const JT_HEADERS       = {
+  'Content-Type': 'application/json',
+  'Origin'      : 'https://www.jtcargo.id',
+  'Referer'     : 'https://www.jtcargo.id/',
+  'language'    : 'ID',
+};
+
+async function cekResiJTCargo(waybillNo) {
+  try {
+    // Step 1 — cek resi ada
+    const r1 = await axios.post(JT_BASE + 'trackingIsNotEmpty',
+      { waybillNo },
+      { headers: JT_HEADERS, timeout: 10000 }
+    );
+    if (!r1.data?.succ || !r1.data?.data) {
+      return { ok: false, msg: 'Resi tidak ditemukan' };
+    }
+
+    // Step 2 — validasi
+    const r2 = await axios.post(JT_BASE + 'trackingValidate',
+      { waybillNo, validateCode: JT_VALIDATE_CODE, searchWaybillOrCustomerOrderId: '1' },
+      { headers: JT_HEADERS, timeout: 10000 }
+    );
+    if (!r2.data?.succ) {
+      return { ok: false, msg: 'Validasi gagal' };
+    }
+
+    // Step 3 — ambil data tracking
+    const r3 = await axios.post(JT_BASE + 'trackingCustomerByWaybillNo',
+      { waybillNo, langType: 'ID', searchWaybillOrCustomerOrderId: '1' },
+      { headers: JT_HEADERS, timeout: 10000 }
+    );
+    if (!r3.data?.succ || !r3.data?.data?.length) {
+      return { ok: false, msg: 'Data tracking kosong' };
+    }
+
+    const trk    = r3.data.data[0];
+    const latest = trk.details[0];
+
+    return {
+      ok            : true,
+      waybillNo,
+      statusCode    : latest.code,
+      status        : latest.status,
+      isDelivered   : latest.code === 100,
+      posisi        : `${latest.scanNetworkName} — ${latest.scanNetworkCity}`,
+      updateTerakhir: latest.scanTime,
+      nextStop      : latest.nextStopName || '-',
+      narasi        : latest.customerTracking || '-',
+      kotaAsal      : trk.senderCityName  || '-',
+      kotaTujuan    : trk.receiverCityName || '-',
+      collectTime   : trk.collectTime     || '-',
+      details       : trk.details,
+    };
+
+  } catch (e) {
+    return { ok: false, msg: e.message || 'Error tidak diketahui' };
+  }
+}
+
+
+// ─── ANALISA SLA VIA CLAUDE ───────────────────────────────
+async function analisaSLAJTCargo(orderInfo, trackingData) {
+  try {
+    const prompt =
+      `Kamu adalah analis logistik pengiriman Indonesia. Analisa pengiriman ini.\n\n` +
+      `DATA:\n` +
+      `- Ekspedisi  : J&T Cargo\n` +
+      `- Resi       : ${trackingData.waybillNo}\n` +
+      `- Asal       : ${trackingData.kotaAsal}\n` +
+      `- Tujuan     : ${trackingData.kotaTujuan}\n` +
+      `- Pickup     : ${trackingData.collectTime}\n` +
+      `- Hari jalan : ${orderInfo.hariJalan} hari\n` +
+      `- SLA        : ${orderInfo.sla} hari\n` +
+      `- Sisa SLA   : ${orderInfo.sisaSLA} hari\n` +
+      `- Status     : ${trackingData.status}\n` +
+      `- Posisi     : ${trackingData.posisi}\n` +
+      `- Next stop  : ${trackingData.nextStop}\n\n` +
+      `RIWAYAT 5 SCAN TERAKHIR:\n` +
+      trackingData.details.slice(0, 5)
+        .map(d => `${d.scanTime} — ${d.scanTypeName} di ${d.scanNetworkName} (${d.scanNetworkCity})`)
+        .join('\n') +
+      `\n\nBerikan analisa SINGKAT (max 2 kalimat) dalam Bahasa Indonesia:\n` +
+      `Apakah berisiko telat? Apa rekomendasinya? Langsung ke intinya.`;
+
+    const response = await anthropic.messages.create({
+      model     : 'claude-haiku-4-5-20251001',
+      max_tokens: 150,
+      messages  : [{ role: 'user', content: prompt }],
+    });
+
+    return response.content[0]?.text || '-';
+  } catch (e) {
+    console.error('analisaSLA error:', e.message);
+    return 'Analisa tidak tersedia';
+  }
+}
+
+
+// ─── DAILY TRACKING REPORT ────────────────────────────────
+async function dailyJTTrackingReport() {
+  console.log('=== SCHEDULER 07:05 WIB — J&T Tracking Report ===');
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) {
+      console.log('Tidak ada data sheet');
+      return;
+    }
+
+    const today    = getToday();
+    const diterima  = [];
+    const berisiko  = [];
+    const overdue   = [];
+    const errors    = [];
+    let   totalPantau = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row    = data[i];
+      const eks    = (row[COL.ekspedisi]     || '').trim();
+      const resi   = (row[COL.resi]          || '').trim();
+      const status = (row[COL.status]        || '').trim().toLowerCase();
+      const slaStr = (row[COL.sla]           || '').trim();
+      const tglKirim = parseDate((row[COL.tglPengiriman] || '').trim());
+      const noOrder  = (row[COL.noOrder]     || '').trim();
+      const customer = (row[COL.customer]    || '-').trim();
+      const shippingNum = (row[COL.shippingNum] || '-').trim();
+
+      // Filter: hanya JNT Cargo, belum selesai, ada resi
+      if (!eks.includes('JNT Cargo')) continue;
+      if (['delivered', 'received', 'return'].includes(status)) continue;
+      if (!resi) continue;
+
+      // Hitung hari jalan & sisa SLA
+      const hariJalan = tglKirim
+        ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000)
+        : 0;
+      const sla = slaStr
+        ? Math.round((new Date(slaStr) - new Date(today)) / 86400000)
+        : null;
+      const sisaSLA = sla !== null ? sla : null;
+
+      totalPantau++;
+
+      // Throttle — jangan DDoS API J&T
+      await new Promise(r => setTimeout(r, 600));
+
+      console.log(`Cek resi [${totalPantau}]: ${resi} (${customer})`);
+      const result = await cekResiJTCargo(resi);
+
+      if (!result.ok) {
+        errors.push(`⚠️ ${shippingNum}\n   👤 ${customer}\n   ❌ ${result.msg}`);
+        continue;
+      }
+
+      // ── Sudah diterima ────────────────────────────────
+      if (result.isDelivered) {
+        // Update sheet otomatis
+        try {
+          const tglTibaVal = result.updateTerakhir.split(' ')[0];
+          await updateCell(SHEET_TAB, i + 1, COL.tglTiba, tglTibaVal);
+          await updateCell(SHEET_TAB, i + 1, COL.status,  'Delivered');
+          await logUpdate('BOT_JT', noOrder, 'Status+TglTiba', status, `Delivered | ${tglTibaVal}`);
+          console.log(`  ✅ Auto-update Delivered: ${noOrder}`);
+        } catch (e) {
+          console.error(`  Gagal update baris ${i+1}:`, e.message);
+        }
+
+        diterima.push(
+          `✅ \`${shippingNum}\`\n` +
+          `   👤 ${customer}\n` +
+          `   📍 ${result.posisi}\n` +
+          `   📅 Diterima: ${result.updateTerakhir}`
+        );
+        continue;
+      }
+
+      // ── Overdue ───────────────────────────────────────
+      if (sisaSLA !== null && sisaSLA < 0) {
+        const overDays = Math.abs(sisaSLA);
+        overdue.push(
+          `🔴 \`${shippingNum}\`\n` +
+          `   👤 ${customer}\n` +
+          `   📍 ${result.posisi}\n` +
+          `   ⏱️ Telat *${overDays} hari* | Jalan: ${hariJalan} hari\n` +
+          `   💬 ${result.narasi}`
+        );
+        continue;
+      }
+
+      // ── Berisiko (sisa SLA ≤ 1 hari) ─────────────────
+      if (sisaSLA !== null && sisaSLA <= 1) {
+        const orderInfo = { hariJalan, sla: slaStr ? Math.round((new Date(slaStr) - new Date(tglKirim)) / 86400000) : '-', sisaSLA };
+        const analisa   = await analisaSLAJTCargo(orderInfo, result);
+
+        berisiko.push(
+          `⚠️ \`${shippingNum}\`\n` +
+          `   👤 ${customer}\n` +
+          `   📍 ${result.posisi}\n` +
+          `   ⏱️ Sisa SLA: *${sisaSLA} hari* | Jalan: ${hariJalan} hari\n` +
+          `   🤖 _${analisa}_`
+        );
+      }
+    }
+
+    // ── Susun laporan ─────────────────────────────────────
+    const lines = [
+      `🏭 *LAPORAN HARIAN OPS PALEMBANG*`,
+      `📅 ${formatDateID(today)} — 07.00 WIB`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    ];
+
+    // Diterima
+    lines.push(`\n✅ *DITERIMA HARI INI — ${diterima.length} resi*`);
+    if (diterima.length) {
+      lines.push('');
+      diterima.forEach(x => lines.push(x));
+    } else {
+      lines.push('_Belum ada._');
+    }
+
+    lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+    // Berisiko
+    lines.push(`\n⚠️ *BERISIKO TELAT — ${berisiko.length} resi*`);
+    if (berisiko.length) {
+      lines.push('');
+      berisiko.forEach(x => lines.push(x));
+    } else {
+      lines.push('_Tidak ada._');
+    }
+
+    lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+    // Overdue
+    lines.push(`\n🔴 *SUDAH LEWAT SLA — ${overdue.length} resi*`);
+    if (overdue.length) {
+      lines.push('');
+      overdue.forEach(x => lines.push(x));
+    } else {
+      lines.push('_Tidak ada._');
+    }
+
+    // Error
+    if (errors.length) {
+      lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      lines.push(`\n🚫 *GAGAL CEK — ${errors.length} resi*\n`);
+      errors.forEach(x => lines.push(x));
+    }
+
+    lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    lines.push(
+      `📊 Total dipantau : *${totalPantau}* resi\n` +
+      `✅ Diterima        : *${diterima.length}*\n` +
+      `⚠️ Berisiko telat  : *${berisiko.length}*\n` +
+      `🔴 Lewat SLA       : *${overdue.length}*\n` +
+      `🚫 Gagal cek       : *${errors.length}*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🤖 _Powered by Claude AI_`
+    );
+
+    const msg = lines.join('\n');
+    await sendToTargets(msg);
+    console.log(`J&T Report selesai — Diterima: ${diterima.length}, Berisiko: ${berisiko.length}, Overdue: ${overdue.length}, Error: ${errors.length}`);
+
+  } catch (e) {
+    console.error('dailyJTTrackingReport error:', e.message);
+    await sendToTargets(`❌ Gagal generate laporan J&T Cargo:\n${e.message}`);
+  }
+}
+
+
+// ─── SCHEDULER 07:05 WIB — J&T Tracking ──────────────────
+// Sengaja 07:05 (bukan 07:00) agar tidak bentrok dengan
+// scheduler reminder H-0 yang sudah ada di jam 07:00
+cron.schedule('5 7 * * *', async () => {
+  await dailyJTTrackingReport();
+}, { timezone: 'Asia/Jakarta' });
+
+
+// ─── ENDPOINT MANUAL TRIGGER (untuk test) ─────────────────
+// Hit: GET /debug/jt-report
+// Hapus atau proteksi endpoint ini setelah selesai testing
+app.get('/debug/jt-report', async (req, res) => {
+  res.json({ ok: true, msg: 'Report sedang diproses, cek WA/Telegram dalam beberapa menit...' });
+  await dailyJTTrackingReport();
+});
+
+// Test cek 1 resi: GET /debug/jt-cek?resi=201565515117
+app.get('/debug/jt-cek', async (req, res) => {
+  const resi = req.query.resi;
+  if (!resi) return res.json({ error: 'Query ?resi= diperlukan' });
+  const result = await cekResiJTCargo(resi);
+  res.json(result);
+});
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`OPS Agent (Claude Haiku) running on port ${PORT}`);
