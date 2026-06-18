@@ -39,4 +39,4 @@ async function testTrackBiteship(noResi) {
 }
 
 // Jalankan tes menggunakan nomor resi simulasi / asli Anda
-testTrackBiteship('993597928');
+testTrackBiteship('000123456789');
