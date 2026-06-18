@@ -1082,7 +1082,7 @@ async function dailyJTTrackingReport() {
       const shippingNum = (row[COL.shippingNum] || '-').trim();
 
       // Filter: hanya JNT Cargo, belum selesai, ada resi
-      if (!eks.includes('JNT Cargo')) continue;
+      if (!eks.match(/j[n&]t\s*cargo/i)) continue;
       if (['delivered', 'received', 'return'].includes(status)) continue;
       if (!resi) continue;
 
