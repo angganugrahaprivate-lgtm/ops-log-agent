@@ -59,15 +59,26 @@ function clearCache(key) { if (key) delete cache[key]; else Object.keys(cache).f
 
 // ─── GOOGLE SHEETS ────────────────────────────────────────
 let sheetsClient = null;
+let sheetsInitPromise = null;
+
 async function getSheets() {
   if (sheetsClient) return sheetsClient;
-  try {
-    const { google } = require('googleapis');
-    const auth = new google.auth.GoogleAuth({ credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS), scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
-    sheetsClient = google.sheets({ version: 'v4', auth });
-    console.log('Google Sheets OK');
-    return sheetsClient;
-  } catch (e) { console.error('Sheets init error:', e.message); return null; }
+  if (!sheetsInitPromise) {
+    sheetsInitPromise = (async () => {
+      try {
+        const { google } = require('googleapis');
+        const auth = new google.auth.GoogleAuth({ credentials: JSON.parse(process.env.GOOGLE_CREDENTIALS), scopes: ['https://www.googleapis.com/auth/spreadsheets'] });
+        sheetsClient = google.sheets({ version: 'v4', auth });
+        console.log('Google Sheets OK');
+        return sheetsClient;
+      } catch (e) {
+        sheetsInitPromise = null; // reset agar bisa retry
+        console.error('Sheets init error:', e.message);
+        return null;
+      }
+    })();
+  }
+  return sheetsInitPromise;
 }
 
 function toCol(n) { let c = ''; while (n >= 0) { c = String.fromCharCode(65 + (n % 26)) + c; n = Math.floor(n / 26) - 1; } return c; }
@@ -280,7 +291,6 @@ async function buildListPengiriman(command, filterPalembang = false) {
   const dateLabel = formatDateID(targetDate);
   if (rows.length === 0) return { msg1: `Tidak ada pengiriman pada ${dateLabel}.`, msg2: null };
 
-  // Group by ekspedisi
   const byEksp = {};
   rows.forEach(r => {
     const eksp = r[COL.ekspedisi] || 'Lainnya';
@@ -288,7 +298,6 @@ async function buildListPengiriman(command, filterPalembang = false) {
     byEksp[eksp].push(r);
   });
 
-  // Pesan 1: detail per ekspedisi
   let msg1 = filterPalembang
     ? `📦 LIST PENGIRIMAN PALEMBANG - ${dateLabel}\n`
     : `📦 LIST PENGIRIMAN - ${dateLabel}\n`;
@@ -304,7 +313,6 @@ async function buildListPengiriman(command, filterPalembang = false) {
     });
   }
 
-  // Pesan 2: shipping numbers only
   let msg2 = `📋 No. Shipping - ${dateLabel}\n`;
   rows.forEach(r => { msg2 += `${r[COL.shippingNum] || '—'}\n`; });
 
@@ -374,6 +382,7 @@ async function getFonnteFile(fileUrl) {
 
 // ─── SMART FILTER ─────────────────────────────────────────
 const chatHistory = {};
+const HISTORY_MAX_SENDERS = 200;
 const NO_DATA_INTENTS = ['greeting','help','out_of_scope','save_instruction'];
 
 function detectIntent(message, senderId) {
@@ -382,6 +391,7 @@ function detectIntent(message, senderId) {
   if (/^(oke|ok|tidak|ga|gak|siap|done|sip|noted|thanks|makasih)$/.test(msg)) return 'greeting';
   if (/kamu bisa|fitur apa|help|bantuan/.test(msg)) return 'help';
   if (/^(catat|ingat|note)\s*:/i.test(msg)) return 'save_instruction';
+  if (/dry.?run|test.?jt|test.?report/.test(msg)) return 'dryrun_jt';  // ← PATCH: dry run intent
   if (/refresh|sync data|reload data/.test(msg)) return 'refresh';
   if (/log hari ini|history update|apa.*diupdate/.test(msg)) return 'log_today';
   if (/list pengiriman|daftar pengiriman|pengiriman (hari ini|besok|lusa|kemarin|\d)/.test(msg)) return 'list_pengiriman';
@@ -533,7 +543,6 @@ Balas: "✅ Dicatat! Aku akan ingat ini."
 async function callClaude(senderId, senderName, userMessage, imageBase64 = null, imageMime = 'image/jpeg') {
   const today = getToday();
 
-  // Jalur foto
   if (imageBase64) {
     if (!chatHistory[senderId]) chatHistory[senderId] = [];
     const messages = [...chatHistory[senderId]];
@@ -550,7 +559,6 @@ async function callClaude(senderId, senderName, userMessage, imageBase64 = null,
     return reply.replace(/ACTION:[^\n]+/g, '').trim();
   }
 
-  // Jalur teks
   const intent = detectIntent(userMessage || '', senderId);
   if (intent === 'out_of_scope') return 'Hmmm gatau sih, diluar konteks itu keknya 😅';
   if (intent === 'confirm_excel') return await insertExcelToSheet(senderName, senderId);
@@ -563,8 +571,7 @@ async function callClaude(senderId, senderName, userMessage, imageBase64 = null,
     return '✅ Dicatat! Aku akan ingat instruksi ini.';
   }
   if (intent === 'list_pengiriman') {
-    const result = await buildListPengiriman(userMessage, false);
-    return result; // handled specially by caller
+    return await buildListPengiriman(userMessage, false);
   }
 
   let rawData = null, filteredResult = null;
@@ -616,6 +623,13 @@ async function callClaude(senderId, senderName, userMessage, imageBase64 = null,
   chatHistory[senderId].push({ role:'user', content:userMessage });
   chatHistory[senderId].push({ role:'assistant', content:reply });
   if (chatHistory[senderId].length > 12) chatHistory[senderId] = chatHistory[senderId].slice(-12);
+
+  // PATCH: cleanup chatHistory kalau terlalu banyak sender
+  if (Object.keys(chatHistory).length > HISTORY_MAX_SENDERS) {
+    const oldest = Object.keys(chatHistory)[0];
+    delete chatHistory[oldest];
+  }
+
   await parseActions(reply, senderId, senderName);
   return reply.replace(/ACTION:[^\n]+/g, '').trim();
 }
@@ -679,66 +693,48 @@ async function getTelegramFile(fileId) {
 }
 
 // ─── HELPER: CEK MENTION BOT ──────────────────────────────
-// FIX: WhatsApp grup mengirim mention sebagai @nomor (bukan @nama),
-// dan formatnya bisa beda (dengan/tanpa kode negara 62).
 function isBotMentioned(message) {
   const msg = message || '';
   const msgLower = msg.toLowerCase();
-
-  // Cek berdasarkan nama mention (misal @nyenyenye)
   if (msgLower.includes(`@${BOT_MENTION}`)) return true;
-
-  // Cek berdasarkan nomor bot dengan berbagai format
-  if (BOT_WA_NUMBER) {
-    const num = BOT_WA_NUMBER.replace(/\D/g, ''); // bersihkan non-digit
-    const variants = [
-      num,                              // 62896535262261
-      num.replace(/^62/, '0'),          // 0896535262261
-      num.replace(/^62/, ''),           // 896535262261
-      num.replace(/^0/, '62'),          // pastikan 62xxx juga dicek
-    ];
-    for (const v of variants) {
-      if (v && msg.includes(`@${v}`)) return true;
-    }
-  }
-
-  return false;
-}
-
-// ─── GROUP WA HANDLER ─────────────────────────────────────
-async function handleGroupMessage(groupId, rawMessage, senderName, senderPhone) {
-  // Bersihkan semua variasi mention bot dari pesan
-  let cleanMsg = rawMessage
-    .replace(new RegExp(`@${BOT_MENTION}`, 'gi'), '');
-
   if (BOT_WA_NUMBER) {
     const num = BOT_WA_NUMBER.replace(/\D/g, '');
     const variants = [
       num,
       num.replace(/^62/, '0'),
       num.replace(/^62/, ''),
+      num.replace(/^0/, '62'),
     ];
+    for (const v of variants) {
+      if (v && msg.includes(`@${v}`)) return true;
+    }
+  }
+  return false;
+}
+
+// ─── GROUP WA HANDLER ─────────────────────────────────────
+async function handleGroupMessage(groupId, rawMessage, senderName, senderPhone) {
+  let cleanMsg = rawMessage.replace(new RegExp(`@${BOT_MENTION}`, 'gi'), '');
+  if (BOT_WA_NUMBER) {
+    const num = BOT_WA_NUMBER.replace(/\D/g, '');
+    const variants = [num, num.replace(/^62/, '0'), num.replace(/^62/, '')];
     for (const v of variants) {
       if (v) cleanMsg = cleanMsg.replace(new RegExp(`@${v}`, 'g'), '');
     }
   }
   cleanMsg = cleanMsg.trim();
-
   console.log(`Group [${senderName}]: ${cleanMsg.substring(0, 80)}`);
 
-  // Mention balik user yang manggil
   const mentionPrefix = senderPhone ? `@${senderPhone} ` : '';
   const mentionArr = senderPhone ? [senderPhone] : [];
 
-  // List pengiriman Palembang
   if (/list pengiriman|daftar pengiriman|pengiriman (hari ini|besok|lusa|kemarin|\d)/.test(cleanMsg.toLowerCase())) {
-    const result = await buildListPengiriman(cleanMsg, true); // filter Palembang
+    const result = await buildListPengiriman(cleanMsg, true);
     await sendWA(groupId, mentionPrefix + result.msg1, mentionArr);
     if (result.msg2) await sendWA(groupId, result.msg2);
     return;
   }
 
-  // Update tgl kirim: update tgl kirim 9228972 12/05/2026
   const updateMatch = cleanMsg.match(/update\s+tgl\s+kirim\s+(\d+)\s+(.+)/i);
   if (updateMatch) {
     const noOrder = updateMatch[1], tanggal = parseDate(updateMatch[2].trim());
@@ -750,7 +746,6 @@ async function handleGroupMessage(groupId, rawMessage, senderName, senderPhone) 
     return;
   }
 
-  // Cek order: cek order 9228972
   const cekMatch = cleanMsg.match(/cek\s+order\s+(\d+)/i);
   if (cekMatch) {
     const noOrder = cekMatch[1];
@@ -770,7 +765,6 @@ async function handleGroupMessage(groupId, rawMessage, senderName, senderPhone) 
     return;
   }
 
-  // Reminder inline: reminder 9228972 15/05/2026 follow up
   const reminderMatch = cleanMsg.match(/reminder\s+(\d+)\s+(\S+)\s+(.+)/i);
   if (reminderMatch) {
     const noOrder = reminderMatch[1], tanggal = parseDate(reminderMatch[2]), note = reminderMatch[3];
@@ -779,7 +773,6 @@ async function handleGroupMessage(groupId, rawMessage, senderName, senderPhone) 
     return;
   }
 
-  // Fallback: info cara pakai
   await sendWA(groupId,
     mentionPrefix +
     `Cara pakai @${BOT_MENTION} di grup:\n\n` +
@@ -837,7 +830,7 @@ app.post('/webhook/wa', async (req, res) => {
   if (!sender) return;
   const isGroup = sender.includes('@g.us');
   const senderName = name || member || sender;
-  const senderPhone = member || null; // nomor HP member grup
+  const senderPhone = member || null;
   const senderId = `wa_${sender}`;
   console.log(`WA [${senderName}${isGroup?'/GROUP':''}]: "${(message||'').substring(0,60)}" file=${!!file}`);
 
@@ -845,7 +838,6 @@ app.post('/webhook/wa', async (req, res) => {
     // GROUP MESSAGE
     if (isGroup) {
       if (!message) return;
-      // FIX: gunakan helper isBotMentioned() yang handle semua format nomor
       if (!isBotMentioned(message)) return;
       await handleGroupMessage(sender, message, senderName, senderPhone);
       return;
@@ -875,6 +867,16 @@ app.post('/webhook/wa', async (req, res) => {
       const result = await buildListPengiriman(message, false);
       await sendWA(sender, result.msg1);
       if (result.msg2) await sendWA(sender, result.msg2);
+      return;
+    }
+
+    // PRIVATE - Dry run J&T
+    if (intent === 'dryrun_jt') {
+      await sendWA(sender, '⏳ Dry run J&T dimulai...\nHasilnya dikirim bertahap, tunggu sebentar ya.');
+      runDryRunWA(sender).catch(e => {
+        console.error('runDryRunWA error:', e.message);
+        sendWA(sender, '❌ Error saat dry run: ' + e.message);
+      });
       return;
     }
 
@@ -944,10 +946,9 @@ cron.schedule('0 7 * * *', async () => {
     console.log(`H-0 reminders sent: ${todayR.length}`);
   } catch (e) { console.error('Scheduler 07:00 error:', e.message); }
 }, { timezone:'Asia/Jakarta' });
+
 // ═══════════════════════════════════════════════════════════
-//  PATCH: J&T CARGO TRACKING + DAILY REPORT
-//  Tambahkan kode ini ke server.js SEBELUM baris app.listen()
-//  Version: 1.0
+//  J&T CARGO TRACKING + DAILY REPORT
 // ═══════════════════════════════════════════════════════════
 
 // ─── J&T CARGO API ────────────────────────────────────────
@@ -962,7 +963,6 @@ const JT_HEADERS       = {
 
 async function cekResiJTCargo(waybillNo) {
   try {
-    // Step 1 — cek resi ada
     const r1 = await axios.post(JT_BASE + 'trackingIsNotEmpty',
       { waybillNo },
       { headers: JT_HEADERS, timeout: 10000 }
@@ -971,7 +971,6 @@ async function cekResiJTCargo(waybillNo) {
       return { ok: false, msg: 'Resi tidak ditemukan' };
     }
 
-    // Step 2 — validasi
     const r2 = await axios.post(JT_BASE + 'trackingValidate',
       { waybillNo, validateCode: JT_VALIDATE_CODE, searchWaybillOrCustomerOrderId: '1' },
       { headers: JT_HEADERS, timeout: 10000 }
@@ -980,7 +979,6 @@ async function cekResiJTCargo(waybillNo) {
       return { ok: false, msg: 'Validasi gagal' };
     }
 
-    // Step 3 — ambil data tracking
     const r3 = await axios.post(JT_BASE + 'trackingCustomerByWaybillNo',
       { waybillNo, langType: 'ID', searchWaybillOrCustomerOrderId: '1' },
       { headers: JT_HEADERS, timeout: 10000 }
@@ -1012,7 +1010,6 @@ async function cekResiJTCargo(waybillNo) {
     return { ok: false, msg: e.message || 'Error tidak diketahui' };
   }
 }
-
 
 // ─── ANALISA SLA VIA CLAUDE ───────────────────────────────
 async function analisaSLAJTCargo(orderInfo, trackingData) {
@@ -1051,7 +1048,6 @@ async function analisaSLAJTCargo(orderInfo, trackingData) {
   }
 }
 
-
 // ─── DAILY TRACKING REPORT ────────────────────────────────
 async function dailyJTTrackingReport() {
   console.log('=== SCHEDULER 07:05 WIB — J&T Tracking Report ===');
@@ -1081,12 +1077,11 @@ async function dailyJTTrackingReport() {
       const customer = (row[COL.customer]    || '-').trim();
       const shippingNum = (row[COL.shippingNum] || '-').trim();
 
-      // Filter: hanya JNT Cargo, belum selesai, ada resi
+      // PATCH: gunakan regex agar match J&T Cargo maupun JNT Cargo
       if (!eks.match(/j[n&]t\s*cargo/i)) continue;
       if (['delivered', 'received', 'return'].includes(status)) continue;
       if (!resi) continue;
 
-      // Hitung hari jalan & sisa SLA
       const hariJalan = tglKirim
         ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000)
         : 0;
@@ -1096,8 +1091,6 @@ async function dailyJTTrackingReport() {
       const sisaSLA = sla !== null ? sla : null;
 
       totalPantau++;
-
-      // Throttle — jangan DDoS API J&T
       await new Promise(r => setTimeout(r, 600));
 
       console.log(`Cek resi [${totalPantau}]: ${resi} (${customer})`);
@@ -1108,9 +1101,7 @@ async function dailyJTTrackingReport() {
         continue;
       }
 
-      // ── Sudah diterima ────────────────────────────────
       if (result.isDelivered) {
-        // Update sheet otomatis
         try {
           const tglTibaVal = result.updateTerakhir.split(' ')[0];
           await updateCell(SHEET_TAB, i + 1, COL.tglTiba, tglTibaVal);
@@ -1130,7 +1121,6 @@ async function dailyJTTrackingReport() {
         continue;
       }
 
-      // ── Overdue ───────────────────────────────────────
       if (sisaSLA !== null && sisaSLA < 0) {
         const overDays = Math.abs(sisaSLA);
         overdue.push(
@@ -1143,7 +1133,6 @@ async function dailyJTTrackingReport() {
         continue;
       }
 
-      // ── Berisiko (sisa SLA ≤ 1 hari) ─────────────────
       if (sisaSLA !== null && sisaSLA <= 1) {
         const orderInfo = { hariJalan, sla: slaStr ? Math.round((new Date(slaStr) - new Date(tglKirim)) / 86400000) : '-', sisaSLA };
         const analisa   = await analisaSLAJTCargo(orderInfo, result);
@@ -1158,45 +1147,26 @@ async function dailyJTTrackingReport() {
       }
     }
 
-    // ── Susun laporan ─────────────────────────────────────
     const lines = [
       `🏭 *LAPORAN HARIAN OPS PALEMBANG*`,
       `📅 ${formatDateID(today)} — 07.00 WIB`,
       `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
     ];
 
-    // Diterima
     lines.push(`\n✅ *DITERIMA HARI INI — ${diterima.length} resi*`);
-    if (diterima.length) {
-      lines.push('');
-      diterima.forEach(x => lines.push(x));
-    } else {
-      lines.push('_Belum ada._');
-    }
+    if (diterima.length) { lines.push(''); diterima.forEach(x => lines.push(x)); }
+    else lines.push('_Belum ada._');
 
     lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-
-    // Berisiko
     lines.push(`\n⚠️ *BERISIKO TELAT — ${berisiko.length} resi*`);
-    if (berisiko.length) {
-      lines.push('');
-      berisiko.forEach(x => lines.push(x));
-    } else {
-      lines.push('_Tidak ada._');
-    }
+    if (berisiko.length) { lines.push(''); berisiko.forEach(x => lines.push(x)); }
+    else lines.push('_Tidak ada._');
 
     lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-
-    // Overdue
     lines.push(`\n🔴 *SUDAH LEWAT SLA — ${overdue.length} resi*`);
-    if (overdue.length) {
-      lines.push('');
-      overdue.forEach(x => lines.push(x));
-    } else {
-      lines.push('_Tidak ada._');
-    }
+    if (overdue.length) { lines.push(''); overdue.forEach(x => lines.push(x)); }
+    else lines.push('_Tidak ada._');
 
-    // Error
     if (errors.length) {
       lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
       lines.push(`\n🚫 *GAGAL CEK — ${errors.length} resi*\n`);
@@ -1224,30 +1194,226 @@ async function dailyJTTrackingReport() {
   }
 }
 
+// ─── DRY RUN J&T VIA WA ───────────────────────────────────
+async function runDryRunWA(waTarget) {
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) {
+      await sendWA(waTarget, '❌ Tidak ada data sheet.');
+      return;
+    }
+
+    const today    = getToday();
+    const diterima = [];
+    const berisiko = [];
+    const overdue  = [];
+    const errors   = [];
+    const skipped  = [];
+    let   totalPantau = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row         = data[i];
+      const eks         = (row[COL.ekspedisi]      || '').trim();
+      const resi        = (row[COL.resi]           || '').trim();
+      const status      = (row[COL.status]         || '').trim().toLowerCase();
+      const slaStr      = (row[COL.sla]            || '').trim();
+      const tglKirim    = parseDate((row[COL.tglPengiriman] || '').trim());
+      const noOrder     = (row[COL.noOrder]        || '').trim();
+      const customer    = (row[COL.customer]       || '-').trim();
+      const shippingNum = (row[COL.shippingNum]    || '-').trim();
+
+      if (!eks.match(/j[n&]t\s*cargo/i)) {
+        skipped.push(`${noOrder || '-'} — bukan JNT (${eks || 'kosong'})`);
+        continue;
+      }
+      if (['delivered', 'received', 'return'].includes(status)) {
+        skipped.push(`${noOrder} — ${status}`);
+        continue;
+      }
+      if (!resi) {
+        skipped.push(`${noOrder} — resi kosong`);
+        continue;
+      }
+
+      const hariJalan = tglKirim
+        ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000)
+        : 0;
+      const sisaSLA = slaStr
+        ? Math.round((new Date(slaStr) - new Date(today)) / 86400000)
+        : null;
+
+      totalPantau++;
+
+      // Progress update setiap 5 resi
+      if (totalPantau % 5 === 0) {
+        await sendWA(waTarget, `⏳ Memproses resi ke-${totalPantau}...`);
+      }
+
+      await new Promise(r => setTimeout(r, 600));
+
+      console.log(`[DRY RUN WA] Cek resi [${totalPantau}]: ${resi} (${customer})`);
+      const result = await cekResiJTCargo(resi);
+
+      if (!result.ok) {
+        errors.push(`❌ ${shippingNum}\n   👤 ${customer}\n   ⚠️ ${result.msg}`);
+        continue;
+      }
+
+      const base =
+        `📦 ${shippingNum}\n` +
+        `👤 ${customer}\n` +
+        `📍 ${result.posisi}\n` +
+        `🕐 ${result.updateTerakhir}`;
+
+      if (result.isDelivered) {
+        diterima.push(`✅ ${base}\n   📅 Diterima: ${result.updateTerakhir}`);
+      } else if (sisaSLA !== null && sisaSLA < 0) {
+        overdue.push(`🔴 ${base}\n   ⏱️ Telat *${Math.abs(sisaSLA)} hari* | Jalan: ${hariJalan} hari\n   💬 ${result.narasi}`);
+      } else if (sisaSLA !== null && sisaSLA <= 1) {
+        berisiko.push(`⚠️ ${base}\n   ⏱️ Sisa SLA: *${sisaSLA} hari* | Jalan: ${hariJalan} hari\n   💬 ${result.narasi}`);
+      } else {
+        skipped.push(`${noOrder} — aman (sisa SLA: ${sisaSLA !== null ? sisaSLA + ' hari' : 'N/A'})`);
+      }
+    }
+
+    // Kirim summary
+    await sendWA(waTarget,
+      `🧪 *DRY RUN SELESAI*\n` +
+      `📅 ${formatDateID(today)}\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `📊 Dipantau : *${totalPantau}*\n` +
+      `✅ Diterima  : *${diterima.length}*\n` +
+      `⚠️ Berisiko  : *${berisiko.length}*\n` +
+      `🔴 Overdue   : *${overdue.length}*\n` +
+      `❌ Error     : *${errors.length}*\n` +
+      `⏭️ Skip      : *${skipped.length}*\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `_Sheet tidak diubah_`
+    );
+
+    if (diterima.length) await sendWA(waTarget, `✅ *DITERIMA (${diterima.length})*\n\n` + diterima.join('\n\n'));
+    if (berisiko.length) await sendWA(waTarget, `⚠️ *BERISIKO TELAT (${berisiko.length})*\n\n` + berisiko.join('\n\n'));
+    if (overdue.length)  await sendWA(waTarget, `🔴 *SUDAH LEWAT SLA (${overdue.length})*\n\n` + overdue.join('\n\n'));
+    if (errors.length)   await sendWA(waTarget, `❌ *GAGAL CEK (${errors.length})*\n\n` + errors.join('\n\n'));
+
+    if (skipped.length) {
+      const preview = skipped.slice(0, 15).join('\n');
+      const more    = skipped.length > 15 ? `\n...+${skipped.length - 15} lainnya` : '';
+      await sendWA(waTarget, `⏭️ *SKIP (${skipped.length})*\n\n${preview}${more}`);
+    }
+
+  } catch (e) {
+    console.error('runDryRunWA error:', e.message);
+    await sendWA(waTarget, `❌ Dry run gagal: ${e.message}`);
+  }
+}
 
 // ─── SCHEDULER 07:05 WIB — J&T Tracking ──────────────────
-// Sengaja 07:05 (bukan 07:00) agar tidak bentrok dengan
-// scheduler reminder H-0 yang sudah ada di jam 07:00
 cron.schedule('5 7 * * *', async () => {
   await dailyJTTrackingReport();
 }, { timezone: 'Asia/Jakarta' });
 
+// ─── DEBUG ENDPOINTS ──────────────────────────────────────
+app.get('/health', (_, res) => res.json({ status:'ok', model:'claude-haiku-4-5-20251001', time_wib:new Date().toLocaleString('id-ID',{timeZone:'Asia/Jakarta'}) }));
 
-// ─── ENDPOINT MANUAL TRIGGER (untuk test) ─────────────────
-// Hit: GET /debug/jt-report
-// Hapus atau proteksi endpoint ini setelah selesai testing
 app.get('/debug/jt-report', async (req, res) => {
   res.json({ ok: true, msg: 'Report sedang diproses, cek WA/Telegram dalam beberapa menit...' });
   await dailyJTTrackingReport();
 });
 
-// Test cek 1 resi: GET /debug/jt-cek?resi=201565515117
 app.get('/debug/jt-cek', async (req, res) => {
   const resi = req.query.resi;
   if (!resi) return res.json({ error: 'Query ?resi= diperlukan' });
   const result = await cekResiJTCargo(resi);
   res.json(result);
 });
+
+app.get('/debug/jt-dryrun', async (req, res) => {
+  console.log('=== DRY RUN J&T Tracking Report ===');
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) {
+      return res.json({ ok: false, msg: 'Tidak ada data sheet' });
+    }
+
+    const today     = getToday();
+    const diterima  = [];
+    const berisiko  = [];
+    const overdue   = [];
+    const errors    = [];
+    const skipped   = [];
+    let   totalPantau = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row      = data[i];
+      const eks      = (row[COL.ekspedisi]      || '').trim();
+      const resi     = (row[COL.resi]           || '').trim();
+      const status   = (row[COL.status]         || '').trim().toLowerCase();
+      const slaStr   = (row[COL.sla]            || '').trim();
+      const tglKirim = parseDate((row[COL.tglPengiriman] || '').trim());
+      const noOrder  = (row[COL.noOrder]        || '').trim();
+      const customer = (row[COL.customer]       || '-').trim();
+      const shippingNum = (row[COL.shippingNum] || '-').trim();
+
+      if (!eks.match(/j[n&]t\s*cargo/i)) {
+        skipped.push({ noOrder, customer, eks, reason: 'bukan JNT Cargo' });
+        continue;
+      }
+      if (['delivered', 'received', 'return'].includes(status)) {
+        skipped.push({ noOrder, customer, eks, status, reason: 'status sudah selesai' });
+        continue;
+      }
+      if (!resi) {
+        skipped.push({ noOrder, customer, eks, reason: 'resi kosong' });
+        continue;
+      }
+
+      const hariJalan = tglKirim
+        ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000)
+        : 0;
+      const sisaSLA = slaStr
+        ? Math.round((new Date(slaStr) - new Date(today)) / 86400000)
+        : null;
+
+      totalPantau++;
+      await new Promise(r => setTimeout(r, 600));
+
+      const result = await cekResiJTCargo(resi);
+
+      if (!result.ok) {
+        errors.push({ shippingNum, customer, noOrder, resi, error: result.msg });
+        continue;
+      }
+
+      const base = { shippingNum, noOrder, customer, resi, hariJalan, sisaSLA, slaStr, statusTracking: result.status, posisi: result.posisi, updateTerakhir: result.updateTerakhir, nextStop: result.nextStop, narasi: result.narasi };
+
+      if (result.isDelivered) {
+        diterima.push({ ...base, tglDiterima: result.updateTerakhir });
+      } else if (sisaSLA !== null && sisaSLA < 0) {
+        overdue.push({ ...base, hariTelat: Math.abs(sisaSLA) });
+      } else if (sisaSLA !== null && sisaSLA <= 1) {
+        const orderInfo = { hariJalan, sla: slaStr ? Math.round((new Date(slaStr) - new Date(tglKirim)) / 86400000) : '-', sisaSLA };
+        const analisa = await analisaSLAJTCargo(orderInfo, result);
+        berisiko.push({ ...base, analisa });
+      } else {
+        skipped.push({ ...base, reason: 'aman, sisa SLA > 1 hari' });
+      }
+    }
+
+    res.json({
+      ok: true, dryRun: true, tanggal: today, totalDipantau: totalPantau,
+      summary: { diterima: diterima.length, berisiko: berisiko.length, overdue: overdue.length, errors: errors.length, skipped: skipped.length },
+      diterima, berisiko, overdue, errors, skipped,
+    });
+
+  } catch (e) {
+    console.error('DRY RUN error:', e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`OPS Agent (Claude Haiku) running on port ${PORT}`);
