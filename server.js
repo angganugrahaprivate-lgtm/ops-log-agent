@@ -1545,6 +1545,56 @@ app.get('/debug/jt-dryrun', async (req, res) => {
   }
 });
 
+// ─── FUNGSI UJI COBA SCRAPER SENTRAL CARGO ────────────────
+async function trackSentralCargoTest(awbNumber) {
+  if (!awbNumber) return "⚠️ Harap masukkan nomor resi.";
+  const cleanAwb = awbNumber.toString().trim();
+  
+  try {
+    const response = await axios.post(
+      'https://sentralcargo.co.id', 
+      new URLSearchParams({ 'awb[]': cleanAwb }),
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        timeout: 10000
+      }
+    );
+
+    const html = response.data;
+    
+    if (html.includes('Data tidak ditemukan') || html.includes('tidak terdaftar')) {
+      return `❌ Resi *${cleanAwb}* tidak ditemukan / tidak valid di Sentral Cargo.`;
+    }
+
+    let statusText = 'ON PROCESS';
+    if (html.toLowerCase().includes('delivered') || html.toLowerCase().includes('diterima oleh')) {
+      statusText = 'DELIVERED';
+    } else if (html.toLowerCase().includes('pod') || html.toLowerCase().includes('dalam pengantaran')) {
+      statusText = 'WITH COURIER';
+    } else if (html.toLowerCase().includes('received at')) {
+      statusText = 'RECEIVED AT HUB';
+    }
+
+    let remark = 'Diproses oleh sistem';
+    const receiverMatch = html.match(/Diterima Oleh\s*:\s*([^<]+)/i) || html.match(/Receiver\s*:\s*([^<]+)/i);
+    if (receiverMatch && receiverMatch[1]) {
+      remark = `Diterima oleh: ${receiverMatch[1].trim()}`;
+    }
+
+    // Mengembalikan teks rapi untuk dikirim ke WA/Telegram
+    return `✅ *HASIL TRACKING SENTRAL CARGO*\n\n` +
+           `• No Resi: ${cleanAwb}\n` +
+           `• Status: *${statusText}*\n` +
+           `• Detail: ${remark}\n\n` +
+           `_Catatan: Pengujian ini aman & tidak mengubah data Google Sheets._`;
+
+  } catch (error) {
+    return `❌ Gagal mengambil data (Error: ${error.message})`;
+  }
+}
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`OPS Agent (Claude Haiku) running on port ${PORT}`);
