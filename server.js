@@ -408,9 +408,6 @@ function detectIntent(message, senderId) {
   if (/pengiriman hari ini|shipped hari ini|dikirim hari ini/.test(msg)) return 'shipped_today';
   if (/^(reminder|ingatkan|set reminder)/.test(msg)) return 'reminder';
   if (/cek reminder|list reminder|reminder apa/.test(msg)) return 'list_reminder';
-  if (/resi.*diterima.*hari ini|diterima.*hari ini|delivered.*hari ini/.test(msg)) return 'jt_diterima';
-  if (/resi.*berisiko|berisiko.*telat|mau.*telat/.test(msg)) return 'jt_berisiko';
-  if (/resi.*telat|telat.*resi|overdue.*resi/.test(msg)) return 'jt_overdue';
   if (/overdue|telat|terlambat|lewat sla/.test(msg)) return 'overdue';
   if (/sla|deadline|mau deadline|mendekati|urgent/.test(msg)) return 'sla_alert';
   if (/pending|waiting|belum dikirim/.test(msg)) return 'pending';
@@ -501,25 +498,28 @@ function computeEkspReport(data) {
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────
 const SYSTEM_PROMPT = `
-Kamu adalah OPS Agent untuk Warehouse & Logistik Palembang (nama: Nyenyenye).
-Bahasa: Indonesia casual. Nada: Santai tapi profesional.
+Kamu adalah Nyenyenye — asisten operasional logistik Warehouse Palembang.
+Bahasa: Indonesia casual. Nada: Santai, friendly, tapi tetap profesional.
+Kamu punya akses ke data order, tracking resi, dan bisa update sheet langsung.
 
-## KEMAMPUAN
-1. Cek & monitor order (pending, SLA, overdue, ekspedisi, summary)
-2. Update Resi → ACTION:UPDATE_RESI:[no_order]:[nilai]
-3. Update Tgl Pengiriman → ACTION:UPDATE_TGL_KIRIM:[no_order]:[YYYY-MM-DD]
-4. Update Tgl Tiba → ACTION:UPDATE_TGL_TIBA:[no_order]:[YYYY-MM-DD]
-5. Update Remark → ACTION:UPDATE_REMARK:[no_order]:[teks]
-6. Set Reminder → ACTION:SAVE_REMINDER:[no_order(s)]:[YYYY-MM-DD]:[note]
-7. Simpan instruksi → ACTION:SAVE_MEMORY:[category]:[content]
-8. List pengiriman by date, cek log, upload Excel
+## KEPRIBADIAN
+- Ngobrol ringan itu oke, tapi tetap fokus ke konteks ops logistik
+- Kalau ditanya kondisi hari ini, kasih summary singkat yang informatif
+- Proaktif: kalau lihat ada yang perlu diperhatikan, sebutin
+- Kalau butuh data atau tracking → gunakan tools yang tersedia
+- Jangan bilang "saya tidak bisa" kalau ada tool yang bisa bantu
 
-JIKA di luar list → balas TEPAT: "Hmmm gatau sih, diluar konteks itu keknya 😅"
+## KEMAMPUAN (via tools)
+- Cek & monitor order: summary, SLA, overdue, per ekspedisi
+- Tracking resi J&T Cargo realtime
+- Update data: resi, tgl kirim, tgl tiba, remark, status
+- Set reminder, simpan instruksi
+- Cari order by nama customer atau nomor
 
-## FORMAT PESAN
+## FORMAT UPDATE (tanpa tool, langsung parse)
 
 ### Format 1 — Update JNL/Palembang
-Field: HARI, TGL, JAM, NO ORDER, EKSPEDISI, Driver, TGL KIRIM, TGL TIBA, KET(abaikan)
+Field: HARI, TGL, JAM, NO ORDER, EKSPEDISI, Driver, TGL KIRIM, TGL TIBA, KET
 → ACTION:UPDATE_RESI:[no_order]:[driver]
 → ACTION:UPDATE_TGL_KIRIM:[no_order]:[YYYY-MM-DD]
 → ACTION:UPDATE_TGL_TIBA:[no_order]:[YYYY-MM-DD]
@@ -529,112 +529,279 @@ Konversi: "12 - May - 2026" → "2026-05-12"
 NO ORDER + REMARK → ACTION:UPDATE_REMARK:[no_order]:[remark]
 
 ### Format 3 — Reminder
-REMINDER + NO ORDER (bisa lebih dari satu, pisah "dan"/",") + TGL + NOTE
 → ACTION:SAVE_REMINDER:[no_order1,no_order2]:[YYYY-MM-DD]:[note]
 
-## INSTRUKSI MEMORY
-"Catat: ..." atau "Ingat: ..." → ACTION:SAVE_MEMORY:instruksi:[content]
-Balas: "✅ Dicatat! Aku akan ingat ini."
+### Memory
+"Catat/Ingat: ..." → ACTION:SAVE_MEMORY:instruksi:[content]
 
 ## ATURAN
-- ACTION hanya di akhir pesan, tidak ditampilkan
-- Konfirmasi sebelum update (kecuali Format 1,2,3 yang sudah jelas)
-- Jika order tidak ditemukan → beritahu dengan jelas
+- ACTION hanya di akhir pesan, tidak ditampilkan ke user
+- Kalau di luar konteks ops logistik → "Hmmm gatau sih, diluar konteks itu keknya 😅"
+- Konfirmasi sebelum update kecuali Format 1,2,3 yang sudah jelas
 `.trim();
 
-// ─── CLAUDE CALL ──────────────────────────────────────────
+// ─── TOOL DEFINITIONS ─────────────────────────────────────
+const TOOLS = [
+  {
+    name: 'get_order_data',
+    description: 'Ambil data order dari Google Sheet. Bisa filter by intent: summary, overdue, sla_alert, no_resi, pending, shipped_today, specific_order, customer_search, ekspedisi, atau all untuk semua data.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        intent: {
+          type: 'string',
+          description: 'Jenis filter data yang dibutuhkan',
+          enum: ['summary', 'overdue', 'sla_alert', 'no_resi', 'pending', 'shipped_today', 'specific_order', 'customer_search', 'ekspedisi', 'all'],
+        },
+        query: {
+          type: 'string',
+          description: 'Query tambahan: nomor order, nama customer, atau nama ekspedisi',
+        },
+      },
+      required: ['intent'],
+    },
+  },
+  {
+    name: 'track_resi_jt',
+    description: 'Cek status tracking resi J&T Cargo secara realtime via API. Gunakan untuk tahu posisi paket, apakah sudah diterima, atau estimasi tiba.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        waybill_no: {
+          type: 'string',
+          description: 'Nomor resi / waybill J&T Cargo',
+        },
+      },
+      required: ['waybill_no'],
+    },
+  },
+  {
+    name: 'update_order',
+    description: 'Update data order di Google Sheet. Bisa update resi, tgl kirim, tgl tiba, remark, atau status.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        no_order: { type: 'string', description: 'Nomor order yang akan diupdate' },
+        field:    { type: 'string', description: 'Field yang diupdate', enum: ['resi', 'tgl_kirim', 'tgl_tiba', 'remark', 'status'] },
+        value:    { type: 'string', description: 'Nilai baru' },
+      },
+      required: ['no_order', 'field', 'value'],
+    },
+  },
+  {
+    name: 'get_sla_status',
+    description: 'Ambil ringkasan status SLA semua order: berapa yang overdue, urgent (H-0), warning (H-1), dan attention (H-2).',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: 'get_daily_summary',
+    description: 'Ambil ringkasan operasional hari ini: total order masuk, dikirim, waiting, belum resi, overdue, dan top kota tujuan.',
+    input_schema: {
+      type: 'object',
+      properties: {},
+      required: [],
+    },
+  },
+];
+
+// ─── TOOL EXECUTOR ────────────────────────────────────────
+async function executeTool(toolName, toolInput, senderId, senderName) {
+  console.log(`[Tool] ${toolName}:`, JSON.stringify(toolInput));
+  try {
+    switch (toolName) {
+
+      case 'get_order_data': {
+        const rawData = await getSheetData();
+        if (!rawData) return { error: 'Gagal ambil data sheet' };
+        const result = filterData(rawData, toolInput.intent, toolInput.query || '');
+        if (!result) return { rows: [], total: 0 };
+        return { rows: result.rows.slice(0, 50), total: result.rows.length };
+      }
+
+      case 'track_resi_jt': {
+        const result = await cekResiJTCargo(toolInput.waybill_no);
+        if (!result.ok) return { error: result.msg };
+        return {
+          waybill_no     : result.waybillNo,
+          status         : result.status,
+          is_delivered   : result.isDelivered,
+          posisi         : result.posisi,
+          update_terakhir: result.updateTerakhir,
+          next_stop      : result.nextStop,
+          narasi         : result.narasi,
+          kota_asal      : result.kotaAsal,
+          kota_tujuan    : result.kotaTujuan,
+          collect_time   : result.collectTime,
+        };
+      }
+
+      case 'update_order': {
+        const fieldMap = {
+          resi      : { col: COL.resi,          name: 'Resi' },
+          tgl_kirim : { col: COL.tglPengiriman,  name: 'Tgl Pengiriman' },
+          tgl_tiba  : { col: COL.tglTiba,        name: 'Tgl Tiba' },
+          remark    : { col: COL.remark,         name: 'Remark' },
+          status    : { col: COL.status,         name: 'Status' },
+        };
+        const f = fieldMap[toolInput.field];
+        if (!f) return { error: 'Field tidak valid' };
+        const value = ['tgl_kirim','tgl_tiba'].includes(toolInput.field)
+          ? parseDate(toolInput.value)
+          : toolInput.value;
+        const ok = await updateOrderField(toolInput.no_order, f.col, f.name, value, senderName);
+        return ok
+          ? { success: true, no_order: toolInput.no_order, field: toolInput.field, value }
+          : { error: `Order ${toolInput.no_order} tidak ditemukan` };
+      }
+
+      case 'get_sla_status': {
+        const rawData = await getSheetData();
+        if (!rawData) return { error: 'Gagal ambil data' };
+        const alerts = computeSLAAlerts(rawData);
+        return alerts || { urgent: [], warning: [], attention: [], overdue: [] };
+      }
+
+      case 'get_daily_summary': {
+        const rawData = await getSheetData();
+        if (!rawData) return { error: 'Gagal ambil data' };
+        return computeDailySummary(rawData) || {};
+      }
+
+      default:
+        return { error: `Tool tidak dikenal: ${toolName}` };
+    }
+  } catch (e) {
+    console.error(`[Tool Error] ${toolName}:`, e.message);
+    return { error: e.message };
+  }
+}
+
+// ─── CLAUDE CALL (with tool use) ──────────────────────────
 async function callClaude(senderId, senderName, userMessage, imageBase64 = null, imageMime = 'image/jpeg') {
   const today = getToday();
 
+  // ── Foto: langsung ke Claude tanpa tool ──────────────────
   if (imageBase64) {
     if (!chatHistory[senderId]) chatHistory[senderId] = [];
     const messages = [...chatHistory[senderId]];
-    messages.push({ role:'user', content:[
-      { type:'image', source:{ type:'base64', media_type:imageMime, data:imageBase64 } },
-      { type:'text', text:`Tanggal: ${today}\nUser: ${senderName}\n\n${userMessage || 'Tolong baca nomor resi dari foto ini.'}` }
+    messages.push({ role: 'user', content: [
+      { type: 'image', source: { type: 'base64', media_type: imageMime, data: imageBase64 } },
+      { type: 'text',  text: `Tanggal: ${today}\nUser: ${senderName}\n\n${userMessage || 'Tolong baca nomor resi dari foto ini.'}` },
     ]});
-    const resp = await anthropic.messages.create({ model:'claude-haiku-4-5-20251001', max_tokens:1000, system:[{ type:'text', text:SYSTEM_PROMPT, cache_control:{ type:'ephemeral' } }], messages });
+    const resp = await anthropic.messages.create({
+      model     : 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      system    : [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      messages,
+    });
     const reply = resp.content[0].text;
-    chatHistory[senderId].push({ role:'user', content:userMessage||'[foto]' });
-    chatHistory[senderId].push({ role:'assistant', content:reply });
+    chatHistory[senderId].push({ role: 'user',      content: userMessage || '[foto]' });
+    chatHistory[senderId].push({ role: 'assistant', content: reply });
     if (chatHistory[senderId].length > 12) chatHistory[senderId] = chatHistory[senderId].slice(-12);
     await parseActions(reply, senderId, senderName);
     return reply.replace(/ACTION:[^\n]+/g, '').trim();
   }
 
+  // ── Shortcut tanpa Claude ─────────────────────────────────
   const intent = detectIntent(userMessage || '', senderId);
-  if (intent === 'out_of_scope') return 'Hmmm gatau sih, diluar konteks itu keknya 😅';
   if (intent === 'confirm_excel') return await insertExcelToSheet(senderName, senderId);
-  if (intent === 'prompt_excel') return '📎 Silakan kirim file Excel-nya langsung ke sini ya!';
-  if (intent === 'refresh') { clearCache(); return '🔄 Data berhasil di-refresh!'; }
-  if (intent === 'log_today') return await getLogToday();
+  if (intent === 'prompt_excel')  return '📎 Silakan kirim file Excel-nya langsung ke sini ya!';
+  if (intent === 'refresh')       { clearCache(); return '🔄 Data berhasil di-refresh!'; }
+  if (intent === 'log_today')     return await getLogToday();
   if (intent === 'save_instruction') {
-    const content = (userMessage || '').replace(/^(catat|ingat|note)\s*:/i, '').trim();
-    await saveMemory('instruksi', content);
+    const cnt = (userMessage || '').replace(/^(catat|ingat|note)\s*:/i, '').trim();
+    await saveMemory('instruksi', cnt);
     return '✅ Dicatat! Aku akan ingat instruksi ini.';
   }
   if (intent === 'list_pengiriman') {
-    return await buildListPengiriman(userMessage, false);
+    const result = await buildListPengiriman(userMessage, false);
+    return result;
   }
+  if (intent === 'out_of_scope') return 'Hmmm gatau sih, diluar konteks itu keknya 😅';
 
-  let rawData = null, filteredResult = null;
-  if (!NO_DATA_INTENTS.includes(intent)) {
-    rawData = await getSheetData();
-    filteredResult = filterData(rawData, intent, userMessage || '');
-  }
-
+  // ── Siapkan context (memory + reminder) ──────────────────
   const [memories, reminders] = await Promise.all([getMemory(), getReminders()]);
-  const instruksi = memories.filter(m => m[1] === 'instruksi');
-  const memoryOther = memories.filter(m => m[1] !== 'instruksi');
-  const todayReminders = reminders.filter(r => r[3] === today && r[5] === 'Pending');
-  const upcomingReminders = reminders.filter(r => r[3] >= today && r[5] === 'Pending');
-  const slaAlerts = ['sla_alert','overdue','summary'].includes(intent) ? computeSLAAlerts(rawData) : null;
-  const dailySummary = intent === 'summary' ? computeDailySummary(rawData) : null;
-  const ekspReport = intent === 'analytics' ? computeEkspReport(rawData) : null;
+  const instruksi        = memories.filter(m => m[1] === 'instruksi');
+  const memoryOther      = memories.filter(m => m[1] !== 'instruksi');
+  const todayReminders   = reminders.filter(r => r[3] === today && r[5] === 'Pending');
+  const upcomingReminders= reminders.filter(r => r[3] >= today && r[5] === 'Pending');
 
   let context = `Tanggal hari ini (WIB): ${today}\nUser: ${senderName}\n\n`;
-  if (instruksi.length > 0) { context += `=== ⚡ INSTRUKSI WAJIB DIIKUTI ===\n`; instruksi.forEach(m => { context += `• ${m[2]}\n`; }); context += '\n'; }
-  if (memoryOther.length > 0) { context += `=== MEMORY ===\n`; memoryOther.forEach(m => { context += `[${m[1]}] ${m[2]}\n`; }); context += '\n'; }
-  if (todayReminders.length > 0) { context += `=== REMINDER HARI INI ===\n`; todayReminders.forEach(r => { context += `Oleh: ${r[1]} | Order: ${r[2]||'-'} | ${r[4]}\n`; }); context += '\n'; }
-  if (upcomingReminders.length > 0) { context += `=== UPCOMING REMINDERS ===\n`; upcomingReminders.forEach(r => { context += `[${r[3]}] Oleh: ${r[1]} | Order: ${r[2]||'-'} | ${r[4]}\n`; }); context += '\n'; }
-  if (slaAlerts) {
-    context += `=== SLA ALERTS ===\nOverdue:${slaAlerts.overdue.length} Urgent:${slaAlerts.urgent.length} Warning:${slaAlerts.warning.length}\n`;
-    if (slaAlerts.overdue.length) context += `Overdue:${JSON.stringify(slaAlerts.overdue)}\n`;
-    if (slaAlerts.urgent.length) context += `Urgent:${JSON.stringify(slaAlerts.urgent)}\n`;
-    if (slaAlerts.warning.length) context += `Warning:${JSON.stringify(slaAlerts.warning)}\n`;
-    context += '\n';
-  }
-  if (dailySummary) context += `=== DAILY SUMMARY ===\n${JSON.stringify(dailySummary)}\n\n`;
-  if (ekspReport) context += `=== EKSPEDISI REPORT ===\n${JSON.stringify(ekspReport)}\n\n`;
-  if (filteredResult && filteredResult.rows.length > 0) context += `=== DATA ORDER [${intent}, ${filteredResult.rows.length} rows] ===\n${JSON.stringify(filteredResult.rows)}\n`;
-  else if (filteredResult) context += `=== DATA ORDER ===\nTidak ada data sesuai filter.\n`;
+  if (instruksi.length)        { context += `=== ⚡ INSTRUKSI ===\n`; instruksi.forEach(m => { context += `• ${m[2]}\n`; }); context += '\n'; }
+  if (memoryOther.length)      { context += `=== MEMORY ===\n`; memoryOther.forEach(m => { context += `[${m[1]}] ${m[2]}\n`; }); context += '\n'; }
+  if (todayReminders.length)   { context += `=== REMINDER HARI INI ===\n`; todayReminders.forEach(r => { context += `Oleh: ${r[1]} | Order: ${r[2]||'-'} | ${r[4]}\n`; }); context += '\n'; }
+  if (upcomingReminders.length){ context += `=== UPCOMING REMINDERS ===\n`; upcomingReminders.forEach(r => { context += `[${r[3]}] Oleh: ${r[1]} | Order: ${r[2]||'-'} | ${r[4]}\n`; }); context += '\n'; }
 
+  // ── Tool use loop ─────────────────────────────────────────
   if (!chatHistory[senderId]) chatHistory[senderId] = [];
   const messages = [...chatHistory[senderId]];
-  messages.push({ role:'user', content:`${context}\n\n${userMessage}` });
+  messages.push({ role: 'user', content: `${context}\n\n${userMessage}` });
 
-  const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 1000,
-    system: [{ type:'text', text:SYSTEM_PROMPT, cache_control:{ type:'ephemeral' } }],
-    messages,
-  });
-  const usage = response.usage;
-  console.log(`[Tokens] in:${usage.input_tokens} out:${usage.output_tokens} cache_write:${usage.cache_creation_input_tokens||0} cache_read:${usage.cache_read_input_tokens||0}`);
+  let finalReply = '';
+  let loopCount  = 0;
+  const MAX_LOOPS = 5;
 
-  const reply = response.content[0].text;
-  chatHistory[senderId].push({ role:'user', content:userMessage });
-  chatHistory[senderId].push({ role:'assistant', content:reply });
-  if (chatHistory[senderId].length > 12) chatHistory[senderId] = chatHistory[senderId].slice(-12);
+  while (loopCount < MAX_LOOPS) {
+    loopCount++;
 
-  // PATCH: cleanup chatHistory kalau terlalu banyak sender
-  if (Object.keys(chatHistory).length > HISTORY_MAX_SENDERS) {
-    const oldest = Object.keys(chatHistory)[0];
-    delete chatHistory[oldest];
+    const response = await anthropic.messages.create({
+      model     : 'claude-haiku-4-5-20251001',
+      max_tokens: 1500,
+      system    : [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
+      tools     : TOOLS,
+      messages,
+    });
+
+    const usage = response.usage;
+    console.log(`[Tokens L${loopCount}] in:${usage.input_tokens} out:${usage.output_tokens} cache_write:${usage.cache_creation_input_tokens||0} cache_read:${usage.cache_read_input_tokens||0}`);
+
+    // ── End turn: Claude selesai jawab ──────────────────────
+    if (response.stop_reason === 'end_turn') {
+      const textBlock = response.content.find(b => b.type === 'text');
+      finalReply = textBlock ? textBlock.text : '';
+      messages.push({ role: 'assistant', content: response.content });
+      break;
+    }
+
+    // ── Tool use: Claude minta jalankan tool ────────────────
+    if (response.stop_reason === 'tool_use') {
+      messages.push({ role: 'assistant', content: response.content });
+
+      // Eksekusi semua tool yang diminta (bisa paralel kalau >1)
+      const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
+      const toolResults   = await Promise.all(
+        toolUseBlocks.map(async (block) => {
+          const result = await executeTool(block.name, block.input, senderId, senderName);
+          return {
+            type        : 'tool_result',
+            tool_use_id : block.id,
+            content     : JSON.stringify(result),
+          };
+        })
+      );
+
+      messages.push({ role: 'user', content: toolResults });
+      continue;
+    }
+
+    // Fallback
+    break;
   }
 
-  await parseActions(reply, senderId, senderName);
-  return reply.replace(/ACTION:[^\n]+/g, '').trim();
+  // ── Simpan history ────────────────────────────────────────
+  chatHistory[senderId].push({ role: 'user',      content: userMessage });
+  chatHistory[senderId].push({ role: 'assistant', content: finalReply  });
+  if (chatHistory[senderId].length > 12) chatHistory[senderId] = chatHistory[senderId].slice(-12);
+  if (Object.keys(chatHistory).length > HISTORY_MAX_SENDERS) {
+    delete chatHistory[Object.keys(chatHistory)[0]];
+  }
+
+  await parseActions(finalReply, senderId, senderName);
+  return finalReply.replace(/ACTION:[^\n]+/g, '').trim();
 }
 
 async function parseActions(text, senderId, senderName) {
@@ -822,10 +989,6 @@ app.post('/webhook/telegram', async (req, res) => {
       if (result.msg2) await sendTelegram(chatId, result.msg2);
       return;
     }
-    if (intent === 'dryrun_jt') { runDryRunWA(String(chatId)).catch(console.error); return; }
-    if (intent === 'jt_diterima') { getJTDiterima(chatId, false).catch(console.error); return; }
-    if (intent === 'jt_berisiko') { getJTBerisiko(chatId, false).catch(console.error); return; }
-    if (intent === 'jt_overdue')  { getJTOverdue(chatId, false).catch(console.error);  return; }
     await sendTelegram(chatId, await callClaude(senderId, firstName, text, imageBase64));
   } catch (e) { console.error('TG error:', e.message); await sendTelegram(chatId, 'Maaf, error: ' + e.message); }
 });
@@ -879,17 +1042,13 @@ app.post('/webhook/wa', async (req, res) => {
 
     // PRIVATE - Dry run J&T
     if (intent === 'dryrun_jt') {
+      await sendWA(sender, '⏳ Dry run J&T dimulai...\nHasilnya dikirim bertahap, tunggu sebentar ya.');
       runDryRunWA(sender).catch(e => {
         console.error('runDryRunWA error:', e.message);
         sendWA(sender, '❌ Error saat dry run: ' + e.message);
       });
       return;
     }
-
-    // PRIVATE - On-demand J&T tracking
-    if (intent === 'jt_diterima') { getJTDiterima(sender, true).catch(console.error); return; }
-    if (intent === 'jt_berisiko') { getJTBerisiko(sender, true).catch(console.error); return; }
-    if (intent === 'jt_overdue')  { getJTOverdue(sender, true).catch(console.error);  return; }
 
     // PRIVATE - Teks biasa
     await sendWA(sender, await callClaude(senderId, senderName, message));
@@ -1060,137 +1219,6 @@ async function analisaSLAJTCargo(orderInfo, trackingData) {
 }
 
 // ─── DAILY TRACKING REPORT ────────────────────────────────
-
-// ─── ON-DEMAND HANDLER: Diterima Hari Ini ────────────────
-async function getJTDiterima(target, isWA) {
-  try {
-    const data = await getSheetData();
-    if (!data) return;
-    const today = getToday();
-    const rows  = data.slice(1).filter(r =>
-      (r[COL.ekspedisi] || '').match(/j[n&]t\s*cargo/i) &&
-      (r[COL.resi]      || '').trim() &&
-      !['delivered', 'received', 'return'].includes((r[COL.status] || '').toLowerCase())
-    );
-    const diterima = [];
-    for (const row of rows) {
-      await new Promise(r => setTimeout(r, 600));
-      const result = await cekResiJTCargo((row[COL.resi] || '').trim());
-      if (!result.ok || !result.isDelivered) continue;
-      if (result.updateTerakhir.split(' ')[0] !== today) continue;
-      diterima.push(
-        `✅ ${row[COL.shippingNum] || '-'}\n` +
-        `   👤 ${row[COL.customer] || '-'}\n` +
-        `   📍 ${result.posisi}\n` +
-        `   📅 ${result.updateTerakhir}`
-      );
-    }
-    const msg = diterima.length
-      ? `✅ *DITERIMA HARI INI — ${diterima.length} resi*\n\n` + diterima.join('\n\n')
-      : `✅ Belum ada resi J&T yang diterima hari ini.`;
-    isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
-  } catch (e) {
-    console.error('getJTDiterima error:', e.message);
-    isWA ? await sendWA(target, '❌ Gagal: ' + e.message) : await sendTelegram(target, '❌ Gagal: ' + e.message);
-  }
-}
-
-// ─── ON-DEMAND HANDLER: Berisiko Telat ───────────────────
-async function getJTBerisiko(target, isWA) {
-  try {
-    const data = await getSheetData();
-    if (!data) return;
-    const today = getToday();
-    const rows  = data.slice(1).filter(r => {
-      if (!(r[COL.ekspedisi] || '').match(/j[n&]t\s*cargo/i)) return false;
-      if (!(r[COL.resi]      || '').trim()) return false;
-      if (['delivered', 'received', 'return'].includes((r[COL.status] || '').toLowerCase())) return false;
-      const slaStr = (r[COL.sla] || '').trim();
-      if (!slaStr) return false;
-      const sisaSLA = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
-      return sisaSLA >= 0 && sisaSLA <= 1;
-    });
-    if (!rows.length) {
-      const msg = `⚠️ Tidak ada resi J&T yang berisiko telat saat ini.`;
-      isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
-      return;
-    }
-    const berisiko = [];
-    for (const row of rows) {
-      const slaStr    = (row[COL.sla]           || '').trim();
-      const tglKirim  = parseDate((row[COL.tglPengiriman] || '').trim());
-      const sisaSLA   = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
-      const hariJalan = tglKirim ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000) : 0;
-      await new Promise(r => setTimeout(r, 600));
-      const result = await cekResiJTCargo((row[COL.resi] || '').trim());
-      if (!result.ok || result.isDelivered) continue;
-      const orderInfo = {
-        hariJalan,
-        sla    : slaStr && tglKirim ? Math.round((new Date(slaStr) - new Date(tglKirim)) / 86400000) : '-',
-        sisaSLA,
-      };
-      const analisa = await analisaSLAJTCargo(orderInfo, result);
-      berisiko.push(
-        `⚠️ ${row[COL.shippingNum] || '-'}\n` +
-        `   👤 ${row[COL.customer] || '-'}\n` +
-        `   📍 ${result.posisi}\n` +
-        `   ⏱️ Sisa SLA: *${sisaSLA} hari* | Jalan: ${hariJalan} hari\n` +
-        `   🤖 ${analisa}`
-      );
-    }
-    const msg = berisiko.length
-      ? `⚠️ *BERISIKO TELAT — ${berisiko.length} resi*\n\n` + berisiko.join('\n\n')
-      : `⚠️ Semua resi J&T yang hampir SLA sudah diterima.`;
-    isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
-  } catch (e) {
-    console.error('getJTBerisiko error:', e.message);
-    isWA ? await sendWA(target, '❌ Gagal: ' + e.message) : await sendTelegram(target, '❌ Gagal: ' + e.message);
-  }
-}
-
-// ─── ON-DEMAND HANDLER: Overdue (dari sheet, no API) ─────
-async function getJTOverdue(target, isWA) {
-  try {
-    const data = await getSheetData();
-    if (!data) return;
-    const today = getToday();
-    const rows  = data.slice(1).filter(r => {
-      if (!(r[COL.ekspedisi] || '').match(/j[n&]t\s*cargo/i)) return false;
-      if (['delivered', 'received', 'return'].includes((r[COL.status] || '').toLowerCase())) return false;
-      const slaStr = (r[COL.sla] || '').trim();
-      if (!slaStr) return false;
-      return Math.round((new Date(slaStr) - new Date(today)) / 86400000) < 0;
-    });
-    if (!rows.length) {
-      const msg = `🔴 Tidak ada resi J&T yang lewat SLA.`;
-      isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
-      return;
-    }
-    const list = rows
-      .map(r => {
-        const slaStr    = (r[COL.sla] || '').trim();
-        const tglKirim  = parseDate((r[COL.tglPengiriman] || '').trim());
-        const sisaSLA   = Math.round((new Date(slaStr) - new Date(today)) / 86400000);
-        const hariJalan = tglKirim ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000) : '?';
-        return {
-          text:
-            `🔴 ${r[COL.shippingNum] || '-'}\n` +
-            `   👤 ${r[COL.customer] || '-'} | 📍 ${r[COL.kota] || '-'}\n` +
-            `   ⏱️ Telat *${Math.abs(sisaSLA)} hari* | Jalan: ${hariJalan} hari\n` +
-            `   📊 Status: ${r[COL.status] || '-'}`,
-          telat: Math.abs(sisaSLA),
-        };
-      })
-      .sort((a, b) => b.telat - a.telat)
-      .map(x => x.text);
-    const msg = `🔴 *SUDAH LEWAT SLA — ${list.length} resi*\n\n` + list.join('\n\n');
-    isWA ? await sendWA(target, msg) : await sendTelegram(target, msg);
-  } catch (e) {
-    console.error('getJTOverdue error:', e.message);
-    isWA ? await sendWA(target, '❌ Gagal: ' + e.message) : await sendTelegram(target, '❌ Gagal: ' + e.message);
-  }
-}
-
 async function dailyJTTrackingReport() {
   console.log('=== SCHEDULER 07:05 WIB — J&T Tracking Report ===');
   try {
@@ -1386,6 +1414,12 @@ async function runDryRunWA(waTarget) {
         : null;
 
       totalPantau++;
+
+      // Progress update setiap 5 resi
+      if (totalPantau % 5 === 0) {
+        await sendWA(waTarget, `⏳ Memproses resi ke-${totalPantau}...`);
+      }
+
       await new Promise(r => setTimeout(r, 600));
 
       console.log(`[DRY RUN WA] Cek resi [${totalPantau}]: ${resi} (${customer})`);
@@ -1413,8 +1447,8 @@ async function runDryRunWA(waTarget) {
       }
     }
 
-    // Kirim 1 pesan ringkasan
-    let msg =
+    // Kirim summary
+    await sendWA(waTarget,
       `🧪 *DRY RUN SELESAI*\n` +
       `📅 ${formatDateID(today)}\n` +
       `━━━━━━━━━━━━━━━\n` +
@@ -1425,14 +1459,19 @@ async function runDryRunWA(waTarget) {
       `❌ Error     : *${errors.length}*\n` +
       `⏭️ Skip      : *${skipped.length}*\n` +
       `━━━━━━━━━━━━━━━\n` +
-      `_Sheet tidak diubah_\n\n`;
+      `_Sheet tidak diubah_`
+    );
 
-    if (diterima.length) msg += `✅ *DITERIMA:*\n` + diterima.join('\n') + '\n\n';
-    if (berisiko.length) msg += `⚠️ *BERISIKO:*\n` + berisiko.join('\n') + '\n\n';
-    if (overdue.length)  msg += `🔴 *OVERDUE:*\n`  + overdue.join('\n')  + '\n\n';
-    if (errors.length)   msg += `❌ *GAGAL CEK:*\n` + errors.join('\n');
+    if (diterima.length) await sendWA(waTarget, `✅ *DITERIMA (${diterima.length})*\n\n` + diterima.join('\n\n'));
+    if (berisiko.length) await sendWA(waTarget, `⚠️ *BERISIKO TELAT (${berisiko.length})*\n\n` + berisiko.join('\n\n'));
+    if (overdue.length)  await sendWA(waTarget, `🔴 *SUDAH LEWAT SLA (${overdue.length})*\n\n` + overdue.join('\n\n'));
+    if (errors.length)   await sendWA(waTarget, `❌ *GAGAL CEK (${errors.length})*\n\n` + errors.join('\n\n'));
 
-    await sendWA(waTarget, msg);
+    if (skipped.length) {
+      const preview = skipped.slice(0, 15).join('\n');
+      const more    = skipped.length > 15 ? `\n...+${skipped.length - 15} lainnya` : '';
+      await sendWA(waTarget, `⏭️ *SKIP (${skipped.length})*\n\n${preview}${more}`);
+    }
 
   } catch (e) {
     console.error('runDryRunWA error:', e.message);
@@ -1545,56 +1584,6 @@ app.get('/debug/jt-dryrun', async (req, res) => {
   }
 });
 
-// ─── FUNGSI UJI COBA SCRAPER SENTRAL CARGO ────────────────
-async function trackSentralCargoTest(awbNumber) {
-  if (!awbNumber) return "⚠️ Harap masukkan nomor resi.";
-  const cleanAwb = awbNumber.toString().trim();
-  
-  try {
-    const response = await axios.post(
-      'https://sentralcargo.co.id', 
-      new URLSearchParams({ 'awb[]': cleanAwb }),
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        timeout: 10000
-      }
-    );
-
-    const html = response.data;
-    
-    if (html.includes('Data tidak ditemukan') || html.includes('tidak terdaftar')) {
-      return `❌ Resi *${cleanAwb}* tidak ditemukan / tidak valid di Sentral Cargo.`;
-    }
-
-    let statusText = 'ON PROCESS';
-    if (html.toLowerCase().includes('delivered') || html.toLowerCase().includes('diterima oleh')) {
-      statusText = 'DELIVERED';
-    } else if (html.toLowerCase().includes('pod') || html.toLowerCase().includes('dalam pengantaran')) {
-      statusText = 'WITH COURIER';
-    } else if (html.toLowerCase().includes('received at')) {
-      statusText = 'RECEIVED AT HUB';
-    }
-
-    let remark = 'Diproses oleh sistem';
-    const receiverMatch = html.match(/Diterima Oleh\s*:\s*([^<]+)/i) || html.match(/Receiver\s*:\s*([^<]+)/i);
-    if (receiverMatch && receiverMatch[1]) {
-      remark = `Diterima oleh: ${receiverMatch[1].trim()}`;
-    }
-
-    // Mengembalikan teks rapi untuk dikirim ke WA/Telegram
-    return `✅ *HASIL TRACKING SENTRAL CARGO*\n\n` +
-           `• No Resi: ${cleanAwb}\n` +
-           `• Status: *${statusText}*\n` +
-           `• Detail: ${remark}\n\n` +
-           `_Catatan: Pengujian ini aman & tidak mengubah data Google Sheets._`;
-
-  } catch (error) {
-    return `❌ Gagal mengambil data (Error: ${error.message})`;
-  }
-}
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`OPS Agent (Claude Haiku) running on port ${PORT}`);
