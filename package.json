@@ -1,7 +1,7 @@
 {
   "name": "ops-log-agent-palembang",
-  "version": "2.0.0",
-  "description": "OPS LOG Agent — Claude Haiku + Google Sheets + WhatsApp + Telegram",
+  "version": "2.1.0",
+  "description": "OPS LOG Agent — Claude Haiku + Google Sheets + WhatsApp + Telegram + J&T + Sentral Cargo Tracking",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -10,6 +10,9 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.24.0",
     "axios": "^1.6.0",
+    "axios-cookiejar-support": "^4.0.0",
+    "tough-cookie": "^4.1.3",
+    "cheerio": "^1.0.0",
     "dotenv": "^16.4.0",
     "express": "^4.18.0",
     "googleapis": "^140.0.0",
