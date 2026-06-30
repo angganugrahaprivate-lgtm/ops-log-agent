@@ -4,6 +4,9 @@ const Anthropic = require('@anthropic-ai/sdk');
 const axios = require('axios');
 const cron = require('node-cron');
 const XLSX = require('xlsx');
+const { wrapper }   = require('axios-cookiejar-support');
+const { CookieJar } = require('tough-cookie');
+const cheerio       = require('cheerio');
 
 const app = express();
 app.use(express.json());
@@ -392,6 +395,7 @@ function detectIntent(message, senderId) {
   if (/kamu bisa|fitur apa|help|bantuan/.test(msg)) return 'help';
   if (/^(catat|ingat|note)\s*:/i.test(msg)) return 'save_instruction';
   if (/dry.?run|test.?jt|test.?report/.test(msg)) return 'dryrun_jt';  // ← PATCH: dry run intent
+  if (/dry.?run.*sentral|test.*sentral|sentral.*dry.?run/.test(msg)) return 'dryrun_sentral';
   if (/refresh|sync data|reload data/.test(msg)) return 'refresh';
   if (/log hari ini|history update|apa.*diupdate/.test(msg)) return 'log_today';
   if (/list pengiriman|daftar pengiriman|pengiriman (hari ini|besok|lusa|kemarin|\d)/.test(msg)) return 'list_pengiriman';
@@ -512,6 +516,7 @@ Kamu punya akses ke data order, tracking resi, dan bisa update sheet langsung.
 ## KEMAMPUAN (via tools)
 - Cek & monitor order: summary, SLA, overdue, per ekspedisi
 - Tracking resi J&T Cargo realtime
+- Tracking resi Sentral Cargo realtime
 - Update data: resi, tgl kirim, tgl tiba, remark, status
 - Set reminder, simpan instruksi
 - Cari order by nama customer atau nomor
@@ -576,6 +581,20 @@ const TOOLS = [
     },
   },
   {
+    name: 'track_resi_sentral',
+    description: 'Cek status tracking resi Sentral Cargo secara realtime. Gunakan untuk tahu posisi paket, apakah sudah diterima, atau riwayat perjalanan.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        waybill_no: {
+          type: 'string',
+          description: 'Nomor resi Sentral Cargo',
+        },
+      },
+      required: ['waybill_no'],
+    },
+  },
+  {
     name: 'update_order',
     description: 'Update data order di Google Sheet. Bisa update resi, tgl kirim, tgl tiba, remark, atau status.',
     input_schema: {
@@ -632,6 +651,22 @@ async function executeTool(toolName, toolInput, senderId, senderName) {
           posisi         : result.posisi,
           update_terakhir: result.updateTerakhir,
           next_stop      : result.nextStop,
+          narasi         : result.narasi,
+          kota_asal      : result.kotaAsal,
+          kota_tujuan    : result.kotaTujuan,
+          collect_time   : result.collectTime,
+        };
+      }
+
+      case 'track_resi_sentral': {
+        const result = await cekResiSentralCargo(toolInput.waybill_no);
+        if (!result.ok) return { error: result.msg };
+        return {
+          waybill_no     : result.waybillNo,
+          status         : result.status,
+          is_delivered   : result.isDelivered,
+          posisi         : result.posisi,
+          update_terakhir: result.updateTerakhir,
           narasi         : result.narasi,
           kota_asal      : result.kotaAsal,
           kota_tujuan    : result.kotaTujuan,
@@ -1046,6 +1081,16 @@ app.post('/webhook/wa', async (req, res) => {
       runDryRunWA(sender).catch(e => {
         console.error('runDryRunWA error:', e.message);
         sendWA(sender, '❌ Error saat dry run: ' + e.message);
+      });
+      return;
+    }
+
+    // PRIVATE - Dry run Sentral Cargo
+    if (intent === 'dryrun_sentral') {
+      await sendWA(sender, '⏳ Dry run Sentral Cargo dimulai...\nHasilnya dikirim bertahap, tunggu sebentar ya.');
+      runDryRunWASentral(sender).catch(e => {
+        console.error('runDryRunWASentral error:', e.message);
+        sendWA(sender, '❌ Error saat dry run Sentral Cargo: ' + e.message);
       });
       return;
     }
@@ -1583,6 +1628,459 @@ app.get('/debug/jt-dryrun', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// ═══════════════════════════════════════════════════════════
+//  SENTRAL CARGO TRACKING
+// ═══════════════════════════════════════════════════════════
+
+const SENTRAL_BASE_URL    = 'https://www.sentralcargo.co.id';
+const SENTRAL_CEKRESI_URL = `${SENTRAL_BASE_URL}/cekresi`;
+const SENTRAL_SUBMIT_URL  = `${SENTRAL_BASE_URL}/resi/data/tracking/submit`;
+
+const SENTRAL_HEADERS = {
+  'User-Agent'     : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept'         : 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
+};
+
+function extractSentralToken(html) {
+  const $ = cheerio.load(html);
+  // Fallback: coba beberapa selector agar tidak breakjika Sentral update UI
+  const token =
+    $('#cekResiForm input[name="_token"]').attr('value') ||
+    $('form input[name="_token"]').first().attr('value') ||
+    $('input[name="_token"]').first().attr('value');
+  if (!token) throw new Error('Gagal menemukan _token di halaman /cekresi.');
+  return token;
+}
+
+function extractSentralTrackingData(html) {
+  // Regex utama
+  let match = html.match(/setTracking\(\s*'[^']*'\s*,\s*(\[[\s\S]*?\])\s*,\s*'(\d+)'/);
+
+  // Fallback regex lebih longgar kalau format sedikit berbeda
+  if (!match) {
+    match = html.match(/setTracking\([^,]*,\s*(\[[\s\S]*?\])\s*,\s*['"](\d+)['"]/);
+  }
+
+  if (!match) {
+    if (html.includes('tidak ditemukan') || html.includes('not found')) return { found: false, reason: 'not_found', data: [] };
+    if (html.includes('Verifikasi nomor telepon'))                       return { found: false, reason: 'otp_required', data: [] };
+    throw new Error('Gagal menemukan data tracking (setTracking) di halaman hasil.');
+  }
+
+  const [, rawArray, resiFromPage] = match;
+  let data;
+  try {
+    data = JSON.parse(rawArray);
+  } catch (err) {
+    throw new Error(`Gagal parse JSON data tracking: ${err.message}`);
+  }
+
+  data = data.filter(item => item !== null);
+  return { found: data.length > 0, reason: data.length > 0 ? 'ok' : 'empty', data, resi: resiFromPage };
+}
+
+async function cekResiSentralCargo(noResi) {
+  const jar    = new CookieJar();
+  const client = wrapper(axios.create({
+    jar,
+    withCredentials: true,
+    headers        : SENTRAL_HEADERS,
+    maxRedirects   : 0,
+    validateStatus : status => status >= 200 && status < 400,
+    timeout        : 15000,
+  }));
+
+  try {
+    // Step 1: GET /cekresi → ambil _token
+    const initialRes = await client.get(SENTRAL_CEKRESI_URL);
+    const token      = extractSentralToken(initialRes.data);
+
+    // Step 2: POST submit form
+    const formBody = new URLSearchParams({
+      _token      : token,
+      nomor_resi  : noResi,
+      no_token    : '',
+      form_botcheck: '',
+    }).toString();
+
+    const submitRes = await client.post(SENTRAL_SUBMIT_URL, formBody, {
+      headers: {
+        ...SENTRAL_HEADERS,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer'     : SENTRAL_CEKRESI_URL,
+      },
+    });
+
+    if (submitRes.status !== 302) {
+      return { ok: false, msg: `Server tidak merespons redirect (status: ${submitRes.status}).` };
+    }
+
+    // Step 3: GET redirect → ambil hasil tracking
+    const redirectLocation = submitRes.headers.location || SENTRAL_CEKRESI_URL;
+    const resultRes = await client.get(redirectLocation, {
+      headers     : { ...SENTRAL_HEADERS, Referer: SENTRAL_SUBMIT_URL },
+      maxRedirects: 5,
+    });
+
+    const tracking = extractSentralTrackingData(resultRes.data);
+
+    if (!tracking.found) {
+      const messages = {
+        not_found   : 'Resi tidak ditemukan di Sentral Cargo',
+        otp_required: 'Verifikasi tambahan diminta oleh server Sentral Cargo',
+        empty       : 'Resi ditemukan tetapi belum ada riwayat perjalanan',
+      };
+      return { ok: false, msg: messages[tracking.reason] || 'Data tidak ditemukan' };
+    }
+
+    const latest      = tracking.data[0];
+    const isDelivered = latest.PODStat === 'Delivered';
+
+    // Parse tanggal — handle format "2026-05-20 14:30:00" dan "2026-05-20T14:30:00"
+    const rawTgl  = latest.PODDt || '';
+    const tglTiba = isDelivered ? rawTgl.split(/[T\s]/)[0] : '';
+
+    return {
+      ok            : true,
+      waybillNo     : noResi,
+      statusCode    : latest.StatCode  || '',
+      status        : latest.PODStat   || 'ON PROCESS',
+      isDelivered,
+      posisi        : latest.PODDesc   || '—',
+      updateTerakhir: rawTgl           || '—',
+      nextStop      : '-',
+      narasi        : latest.PODDesc   || '—',
+      tglTiba,
+      kotaAsal      : '-',
+      kotaTujuan    : '-',
+      collectTime   : tracking.data[tracking.data.length - 1]?.PODDt || '-',
+      details       : tracking.data.map(d => ({
+        scanTime        : d.PODDt,
+        scanTypeName    : d.PODStat,
+        scanNetworkName : (d.PODDesc.match(/\[([^\]]+)\]/) || [])[1] || d.PODDesc,
+        scanNetworkCity : '-',
+        customerTracking: d.PODDesc,
+      })),
+    };
+  } catch (error) {
+    return { ok: false, msg: error.message || 'Error tidak diketahui' };
+  }
+}
+
+// ─── ANALISA SLA SENTRAL via Claude ──────────────────────────
+async function analisaSLASentralCargo(orderInfo, trackingData) {
+  try {
+    const prompt =
+      `Kamu adalah analis logistik pengiriman Indonesia. Analisa pengiriman Sentral Cargo ini.\n\n` +
+      `DATA:\n` +
+      `- Ekspedisi  : Sentral Cargo\n` +
+      `- Resi       : ${trackingData.waybillNo}\n` +
+      `- Hari jalan : ${orderInfo.hariJalan} hari\n` +
+      `- SLA        : ${orderInfo.sla} hari\n` +
+      `- Sisa SLA   : ${orderInfo.sisaSLA} hari\n` +
+      `- Status     : ${trackingData.status}\n` +
+      `- Posisi     : ${trackingData.posisi}\n\n` +
+      `RIWAYAT 5 SCAN TERAKHIR:\n` +
+      (trackingData.details || []).slice(0, 5)
+        .map(d => `${d.scanTime} — ${d.scanTypeName} di ${d.scanNetworkName}`)
+        .join('\n') +
+      `\n\nBerikan analisa SINGKAT (max 2 kalimat) dalam Bahasa Indonesia:\n` +
+      `Apakah berisiko telat? Apa rekomendasinya? Langsung ke intinya.`;
+
+    const response = await anthropic.messages.create({
+      model     : 'claude-haiku-4-5-20251001',
+      max_tokens: 150,
+      messages  : [{ role: 'user', content: prompt }],
+    });
+    return response.content[0]?.text || '-';
+  } catch (e) {
+    console.error('analisaSLASentral error:', e.message);
+    return 'Analisa tidak tersedia';
+  }
+}
+
+// ─── DAILY SENTRAL TRACKING REPORT ───────────────────────────
+async function dailySentralTrackingReport() {
+  console.log('=== SCHEDULER 07:30 WIB — Sentral Cargo Tracking Report ===');
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) { console.log('Tidak ada data sheet'); return; }
+
+    const today     = getToday();
+    const diterima   = [];
+    const berisiko   = [];
+    const overdue    = [];
+    const errors     = [];
+    let   totalPantau = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row         = data[i];
+      const eks         = (row[COL.ekspedisi]      || '').trim();
+      const resi        = (row[COL.resi]           || '').trim();
+      const status      = (row[COL.status]         || '').trim().toLowerCase();
+      const slaStr      = (row[COL.sla]            || '').trim();
+      const tglKirim    = parseDate((row[COL.tglPengiriman] || '').trim());
+      const noOrder     = (row[COL.noOrder]        || '').trim();
+      const customer    = (row[COL.customer]       || '-').trim();
+      const shippingNum = (row[COL.shippingNum]    || '-').trim();
+
+      if (!eks.match(/sentral\s*cargo/i)) continue;
+      if (['delivered', 'received', 'return'].includes(status)) continue;
+      if (!resi) continue;
+
+      const hariJalan = tglKirim
+        ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000)
+        : 0;
+      const sisaSLA = slaStr
+        ? Math.round((new Date(slaStr) - new Date(today)) / 86400000)
+        : null;
+
+      totalPantau++;
+      await new Promise(r => setTimeout(r, 600));
+
+      console.log(`Cek resi Sentral [${totalPantau}]: ${resi} (${customer})`);
+      const result = await cekResiSentralCargo(resi);
+
+      if (!result.ok) {
+        errors.push(`⚠️ ${shippingNum}\n   👤 ${customer}\n   ❌ ${result.msg}`);
+        continue;
+      }
+
+      if (result.isDelivered) {
+        try {
+          await updateCell(SHEET_TAB, i + 1, COL.tglTiba, result.tglTiba);
+          await updateCell(SHEET_TAB, i + 1, COL.status,  'Delivered');
+          await logUpdate('BOT_SENTRAL', noOrder, 'Status+TglTiba', status, `Delivered | ${result.tglTiba}`);
+          console.log(`  ✅ Auto-update Delivered: ${noOrder}`);
+        } catch (e) { console.error(`  Gagal update baris ${i+1}:`, e.message); }
+
+        diterima.push(
+          `✅ \`${shippingNum}\`\n` +
+          `   👤 ${customer}\n` +
+          `   📍 ${result.posisi}\n` +
+          `   📅 Diterima: ${result.updateTerakhir}`
+        );
+        continue;
+      }
+
+      if (sisaSLA !== null && sisaSLA < 0) {
+        overdue.push(
+          `🔴 \`${shippingNum}\`\n` +
+          `   👤 ${customer}\n` +
+          `   📍 ${result.posisi}\n` +
+          `   ⏱️ Telat *${Math.abs(sisaSLA)} hari* | Jalan: ${hariJalan} hari\n` +
+          `   💬 ${result.narasi}`
+        );
+        continue;
+      }
+
+      if (sisaSLA !== null && sisaSLA <= 1) {
+        const orderInfo = { hariJalan, sla: slaStr ? Math.round((new Date(slaStr) - new Date(tglKirim)) / 86400000) : '-', sisaSLA };
+        const analisa   = await analisaSLASentralCargo(orderInfo, result);
+        berisiko.push(
+          `⚠️ \`${shippingNum}\`\n` +
+          `   👤 ${customer}\n` +
+          `   📍 ${result.posisi}\n` +
+          `   ⏱️ Sisa SLA: *${sisaSLA} hari* | Jalan: ${hariJalan} hari\n` +
+          `   🤖 _${analisa}_`
+        );
+      }
+    }
+
+    const lines = [
+      `🏭 *LAPORAN HARIAN SENTRAL CARGO*`,
+      `📅 ${formatDateID(today)} — 07.30 WIB`,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+    ];
+    lines.push(`\n✅ *DITERIMA HARI INI — ${diterima.length} resi*`);
+    if (diterima.length) { lines.push(''); diterima.forEach(x => lines.push(x)); }
+    else lines.push('_Belum ada._');
+
+    lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    lines.push(`\n⚠️ *BERISIKO TELAT — ${berisiko.length} resi*`);
+    if (berisiko.length) { lines.push(''); berisiko.forEach(x => lines.push(x)); }
+    else lines.push('_Tidak ada._');
+
+    lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    lines.push(`\n🔴 *SUDAH LEWAT SLA — ${overdue.length} resi*`);
+    if (overdue.length) { lines.push(''); overdue.forEach(x => lines.push(x)); }
+    else lines.push('_Tidak ada._');
+
+    if (errors.length) {
+      lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      lines.push(`\n🚫 *GAGAL CEK — ${errors.length} resi*\n`);
+      errors.forEach(x => lines.push(x));
+    }
+
+    lines.push(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    lines.push(
+      `📊 Total dipantau : *${totalPantau}* resi\n` +
+      `✅ Diterima        : *${diterima.length}*\n` +
+      `⚠️ Berisiko telat  : *${berisiko.length}*\n` +
+      `🔴 Lewat SLA       : *${overdue.length}*\n` +
+      `🚫 Gagal cek       : *${errors.length}*\n` +
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n` +
+      `🤖 _Powered by Claude AI_`
+    );
+
+    await sendToTargets(lines.join('\n'));
+    console.log(`Sentral Report — Diterima: ${diterima.length}, Berisiko: ${berisiko.length}, Overdue: ${overdue.length}, Error: ${errors.length}`);
+  } catch (e) {
+    console.error('dailySentralTrackingReport error:', e.message);
+    await sendToTargets(`❌ Gagal generate laporan Sentral Cargo:\n${e.message}`);
+  }
+}
+
+// ─── DRY RUN SENTRAL via WA ───────────────────────────────────
+async function runDryRunWASentral(waTarget) {
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) { await sendWA(waTarget, '❌ Tidak ada data sheet.'); return; }
+
+    const today     = getToday();
+    const diterima   = [];
+    const berisiko   = [];
+    const overdue    = [];
+    const errors     = [];
+    const skipped    = [];
+    let   totalPantau = 0;
+
+    for (let i = 1; i < data.length; i++) {
+      const row         = data[i];
+      const eks         = (row[COL.ekspedisi]      || '').trim();
+      const resi        = (row[COL.resi]           || '').trim();
+      const status      = (row[COL.status]         || '').trim().toLowerCase();
+      const slaStr      = (row[COL.sla]            || '').trim();
+      const tglKirim    = parseDate((row[COL.tglPengiriman] || '').trim());
+      const noOrder     = (row[COL.noOrder]        || '').trim();
+      const customer    = (row[COL.customer]       || '-').trim();
+      const shippingNum = (row[COL.shippingNum]    || '-').trim();
+
+      if (!eks.match(/sentral\s*cargo/i)) { skipped.push(`${noOrder||'-'} — bukan Sentral Cargo`); continue; }
+      if (['delivered','received','return'].includes(status)) { skipped.push(`${noOrder} — ${status}`); continue; }
+      if (!resi) { skipped.push(`${noOrder} — resi kosong`); continue; }
+
+      const hariJalan = tglKirim ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000) : 0;
+      const sisaSLA   = slaStr   ? Math.round((new Date(slaStr) - new Date(today)) / 86400000)   : null;
+
+      totalPantau++;
+      if (totalPantau % 5 === 0) await sendWA(waTarget, `⏳ Memproses resi Sentral Cargo ke-${totalPantau}...`);
+      await new Promise(r => setTimeout(r, 600));
+
+      console.log(`[DRY RUN WA - Sentral] Cek resi [${totalPantau}]: ${resi} (${customer})`);
+      const result = await cekResiSentralCargo(resi);
+
+      if (!result.ok) { errors.push(`❌ ${shippingNum}\n   👤 ${customer}\n   ⚠️ ${result.msg}`); continue; }
+
+      const base =
+        `📦 ${shippingNum}\n` +
+        `👤 ${customer}\n` +
+        `📍 ${result.posisi}\n` +
+        `🕐 ${result.updateTerakhir}`;
+
+      if (result.isDelivered) {
+        diterima.push(`✅ ${base}`);
+      } else if (sisaSLA !== null && sisaSLA < 0) {
+        overdue.push(`🔴 ${base}\n   ⏱️ Telat *${Math.abs(sisaSLA)} hari* | Jalan: ${hariJalan} hari`);
+      } else if (sisaSLA !== null && sisaSLA <= 1) {
+        berisiko.push(`⚠️ ${base}\n   ⏱️ Sisa SLA: *${sisaSLA} hari* | Jalan: ${hariJalan} hari`);
+      } else {
+        skipped.push(`${noOrder} — aman (sisa SLA: ${sisaSLA !== null ? sisaSLA + ' hari' : 'N/A'})`);
+      }
+    }
+
+    await sendWA(waTarget,
+      `🧪 *DRY RUN SENTRAL CARGO SELESAI*\n` +
+      `📅 ${formatDateID(today)}\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `📊 Dipantau : *${totalPantau}*\n` +
+      `✅ Diterima  : *${diterima.length}*\n` +
+      `⚠️ Berisiko  : *${berisiko.length}*\n` +
+      `🔴 Overdue   : *${overdue.length}*\n` +
+      `❌ Error     : *${errors.length}*\n` +
+      `⏭️ Skip      : *${skipped.length}*\n` +
+      `━━━━━━━━━━━━━━━\n` +
+      `_Sheet tidak diubah_`
+    );
+    if (diterima.length) await sendWA(waTarget, `✅ *DITERIMA (${diterima.length})*\n\n` + diterima.join('\n\n'));
+    if (berisiko.length) await sendWA(waTarget, `⚠️ *BERISIKO TELAT (${berisiko.length})*\n\n` + berisiko.join('\n\n'));
+    if (overdue.length)  await sendWA(waTarget, `🔴 *SUDAH LEWAT SLA (${overdue.length})*\n\n` + overdue.join('\n\n'));
+    if (errors.length)   await sendWA(waTarget, `❌ *GAGAL CEK (${errors.length})*\n\n` + errors.join('\n\n'));
+    if (skipped.length) {
+      const preview = skipped.slice(0,15).join('\n');
+      const more    = skipped.length > 15 ? `\n...+${skipped.length-15} lainnya` : '';
+      await sendWA(waTarget, `⏭️ *SKIP (${skipped.length})*\n\n${preview}${more}`);
+    }
+  } catch (e) {
+    console.error('runDryRunWASentral error:', e.message);
+    await sendWA(waTarget, `❌ Dry run Sentral Cargo gagal: ${e.message}`);
+  }
+}
+
+// ─── SCHEDULER 07:30 WIB — Sentral Cargo Tracking ─────────────
+cron.schedule('30 7 * * *', async () => {
+  await dailySentralTrackingReport();
+}, { timezone: 'Asia/Jakarta' });
+
+// ─── DEBUG ENDPOINTS SENTRAL ───────────────────────────────────
+app.get('/debug/sentral-report', async (req, res) => {
+  res.json({ ok: true, msg: 'Report Sentral sedang diproses, cek WA/Telegram...' });
+  await dailySentralTrackingReport();
+});
+
+app.get('/debug/sentral-cek', async (req, res) => {
+  const resi = req.query.resi;
+  if (!resi) return res.json({ error: 'Query ?resi= diperlukan' });
+  const result = await cekResiSentralCargo(resi);
+  res.json(result);
+});
+
+app.get('/debug/sentral-dryrun', async (req, res) => {
+  console.log('=== DRY RUN Sentral Cargo ===');
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) return res.json({ ok: false, msg: 'Tidak ada data sheet' });
+    const today = getToday();
+    const diterima = [], berisiko = [], overdue = [], errors = [], skipped = [];
+    let totalPantau = 0;
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const eks = (row[COL.ekspedisi] || '').trim();
+      const resi = (row[COL.resi] || '').trim();
+      const status = (row[COL.status] || '').trim().toLowerCase();
+      const slaStr = (row[COL.sla] || '').trim();
+      const tglKirim = parseDate((row[COL.tglPengiriman] || '').trim());
+      const noOrder = (row[COL.noOrder] || '').trim();
+      const customer = (row[COL.customer] || '-').trim();
+      const shippingNum = (row[COL.shippingNum] || '-').trim();
+      if (!eks.match(/sentral\s*cargo/i)) { skipped.push({ noOrder, reason: 'bukan Sentral Cargo' }); continue; }
+      if (['delivered','received','return'].includes(status)) { skipped.push({ noOrder, status, reason: 'sudah selesai' }); continue; }
+      if (!resi) { skipped.push({ noOrder, reason: 'resi kosong' }); continue; }
+      const hariJalan = tglKirim ? Math.round((new Date(today) - new Date(tglKirim)) / 86400000) : 0;
+      const sisaSLA   = slaStr   ? Math.round((new Date(slaStr) - new Date(today)) / 86400000)   : null;
+      totalPantau++;
+      await new Promise(r => setTimeout(r, 600));
+      const result = await cekResiSentralCargo(resi);
+      if (!result.ok) { errors.push({ shippingNum, customer, noOrder, resi, error: result.msg }); continue; }
+      const base = { shippingNum, noOrder, customer, resi, hariJalan, sisaSLA, statusTracking: result.status, posisi: result.posisi, updateTerakhir: result.updateTerakhir };
+      if (result.isDelivered)                              diterima.push({ ...base });
+      else if (sisaSLA !== null && sisaSLA < 0)            overdue.push({ ...base, hariTelat: Math.abs(sisaSLA) });
+      else if (sisaSLA !== null && sisaSLA <= 1)           berisiko.push({ ...base });
+      else                                                  skipped.push({ ...base, reason: 'aman' });
+    }
+    res.json({ ok: true, dryRun: true, tanggal: today, totalDipantau: totalPantau,
+      summary: { diterima: diterima.length, berisiko: berisiko.length, overdue: overdue.length, errors: errors.length, skipped: skipped.length },
+      diterima, berisiko, overdue, errors, skipped });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // ─── START ────────────────────────────────────────────────
 app.listen(PORT, () => {
