@@ -423,6 +423,7 @@ function detectIntent(message, senderId) {
   if (/^(catat|ingat|note)\s*:/i.test(msg)) return 'save_instruction';
   if (/dry.?run|test.?jt|test.?report/.test(msg)) return 'dryrun_jt';  // ← PATCH: dry run intent
   if (/dry.?run.*sentral|test.*sentral|sentral.*dry.?run/.test(msg)) return 'dryrun_sentral';
+  if (/fu\s*sentral|follow\s*up\s*sentral|sentral.*\bfu\b|pesan\s*(fu|follow\s*up).*sentral|fu\s*ke\s*sentral/.test(msg)) return 'fu_sentral';
   if (/refresh|sync data|reload data/.test(msg)) return 'refresh';
   if (/log hari ini|history update|apa.*diupdate/.test(msg)) return 'log_today';
   if (/list pengiriman|daftar pengiriman|pengiriman (hari ini|besok|lusa|kemarin|\d)/.test(msg)) return 'list_pengiriman';
@@ -525,6 +526,77 @@ function computeEkspReport(data) {
     else report[eksp].pending++;
   });
   return report;
+}
+
+// ─── LAPORAN OPS DIRANGKUM CLAUDE (PAGI & SORE) ───────────────
+// Kumpulkan H-1 pending + ringkasan harian + performa ekspedisi,
+// lalu minta Claude susun jadi laporan formal terstruktur.
+// (SLA Alert sengaja tidak disertakan, per permintaan user)
+async function generateOpsSummaryNarrative(period) {
+  clearCache('sheetData');
+  const data = await getSheetData();
+  if (!data || data.length < 2) return null;
+
+  const today = getToday();
+  const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
+  const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone:'Asia/Jakarta' });
+
+  const h1 = data.slice(1).filter(r => (r[COL.requestDate]||'').trim() === tomorrowStr && (r[COL.status]||'').toLowerCase() !== 'received');
+  const summary = computeDailySummary(data);
+  const eksp = computeEkspReport(data);
+  if (!summary && h1.length === 0 && !eksp) return null;
+
+  const h1Text = h1.length
+    ? h1.map(r => `- ${r[COL.noOrder]} (${r[COL.customer]||'-'}, ${r[COL.ekspedisi]||'-'}) — resi: ${r[COL.resi] || 'BELUM ADA'}`).join('\n')
+    : 'Tidak ada order dengan request date besok.';
+
+  const ekspText = eksp
+    ? Object.entries(eksp).map(([nama, e]) => `- ${nama}: total ${e.total}, on-time ${e.ontime}, telat ${e.late}, pending ${e.pending}`).join('\n')
+    : '-';
+
+  const dataBlock =
+    `Tanggal: ${today}\n\n` +
+    `=== H-1 PENDING (request date besok: ${tomorrowStr}) ===\n${h1Text}\n\n` +
+    `=== RINGKASAN HARIAN ===\n` +
+    `Kiriman baru hari ini: ${summary?.shippedToday ?? 0}\n` +
+    `Masih pending: ${summary?.waiting ?? 0}\n` +
+    `Belum ada resi: ${summary?.noResi ?? 0}\n` +
+    `Overdue SLA: ${summary?.overdue ?? 0}\n` +
+    `Top kota tujuan: ${(summary?.topKota || []).map(([k,v]) => `${k} (${v})`).join(', ') || '-'}\n\n` +
+    `=== PERFORMA EKSPEDISI ===\n${ekspText}`;
+
+  const isPagi = period === 'pagi';
+  const prompt =
+    `Kamu adalah asisten operasional logistik. Susun data berikut jadi laporan ${isPagi ? 'pagi' : 'sore (evaluasi hari ini)'} ` +
+    `yang formal dan terstruktur dalam Bahasa Indonesia, untuk dikirim ke tim via WhatsApp/Telegram.\n\n` +
+    `Format WAJIB (pakai heading persis seperti ini, jangan tambah bagian SLA Alert terpisah):\n` +
+    `📋 RINGKASAN OPERASIONAL — [tanggal]\n\n` +
+    `1. H-1 Pending (Kirim Besok)\n` +
+    `2. Ringkasan Harian\n` +
+    `3. Performa Ekspedisi\n` +
+    `4. Catatan Prioritas (aksi yang perlu ditindaklanjuti segera, kalau ada)\n\n` +
+    (isPagi ? '' : 'Karena ini laporan sore, framing sebagai evaluasi/rekap hari ini, bukan rencana ke depan.\n\n') +
+    `DATA:\n${dataBlock}\n\n` +
+    `Tulis singkat, padat, dan actionable. Jangan mengarang data yang tidak ada di atas.`;
+
+  const response = await anthropic.messages.create({
+    model     : 'claude-haiku-4-5-20251001',
+    max_tokens: 700,
+    messages  : [{ role: 'user', content: prompt }],
+  });
+  return response.content.find(b => b.type === 'text')?.text || null;
+}
+
+async function sendOpsSummary(period) {
+  console.log(`=== LAPORAN OPS (${period.toUpperCase()}) ===`);
+  try {
+    const narrative = await generateOpsSummaryNarrative(period);
+    if (narrative) await sendToTargets(narrative);
+    else console.log('Tidak ada data untuk laporan ops.');
+  } catch (e) {
+    console.error(`sendOpsSummary(${period}) error:`, e.message);
+    await sendToTargets(`❌ Gagal generate laporan ${period}: ${e.message}`);
+  }
 }
 
 // ─── SYSTEM PROMPT ────────────────────────────────────────
@@ -824,6 +896,7 @@ async function callClaude(senderId, senderName, userMessage, imageBase64 = null,
     const result = await buildListPengiriman(userMessage, false);
     return result;
   }
+  if (intent === 'fu_sentral') return await buildFUSentralMessage();
   if (intent === 'out_of_scope') return 'Hmmm gatau sih, diluar konteks itu keknya 😅';
 
   // ── Siapkan context (memory + reminder) ──────────────────
@@ -1171,34 +1244,11 @@ app.post('/webhook/wa', async (req, res) => {
 
 // ─── SCHEDULERS ───────────────────────────────────────────
 
-// 08:00 WIB — H-1 Pending + SLA Alert
-cron.schedule('0 8 * * *', async () => {
-  console.log('=== SCHEDULER 08:00 WIB ===');
-  try {
-    clearCache('sheetData');
-    const data = await getSheetData();
-    const today = getToday();
-    const tomorrow = new Date(); tomorrow.setDate(tomorrow.getDate() + 1);
-    const tomorrowStr = tomorrow.toLocaleDateString('sv-SE', { timeZone:'Asia/Jakarta' });
-    if (data) {
-      const h1 = data.slice(1).filter(r => (r[COL.requestDate]||'').trim() === tomorrowStr && (r[COL.status]||'').toLowerCase() !== 'received');
-      if (h1.length > 0) {
-        let msg = `🔔 H-1 PENDING REMINDER\nRequest Date besok: ${tomorrowStr}\n\n`;
-        h1.forEach(r => { msg += `📦 ${r[COL.noOrder]} — ${r[COL.customer]} (${r[COL.ekspedisi]||'—'})\n`; msg += r[COL.resi] ? `  ✅ Resi: ${r[COL.resi]}\n` : `  ❌ Resi belum diinput!\n`; });
-        msg += `\nTotal: ${h1.length} order`;
-        await sendToTargets(msg);
-      }
-      const sla = computeSLAAlerts(data);
-      if (sla && (sla.urgent.length > 0 || sla.overdue.length > 0)) {
-        let msg = `⚠️ ALERT SLA - ${today}\n\n`;
-        if (sla.overdue.length) { msg += `🚨 OVERDUE (${sla.overdue.length}):\n`; sla.overdue.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; }); msg += '\n'; }
-        if (sla.urgent.length) { msg += `🔴 URGENT H-0 (${sla.urgent.length}):\n`; sla.urgent.forEach(o => { msg += `• ${o.no_order} - ${o.customer}\n`; }); msg += '\n'; }
-        if (sla.warning.length) { msg += `🟡 WARNING H-1 (${sla.warning.length}):\n`; sla.warning.forEach(o => { msg += `• ${o.no_order} - ${o.customer} | SLA: ${o.sla}\n`; }); }
-        await sendToTargets(msg);
-      }
-    }
-  } catch (e) { console.error('Scheduler 08:00 error:', e.message); }
-}, { timezone:'Asia/Jakarta' });
+// 08:00 WIB — Laporan Ops Pagi (dirangkum Claude)
+cron.schedule('0 8 * * *', async () => { await sendOpsSummary('pagi'); }, { timezone:'Asia/Jakarta' });
+
+// 17:30 WIB — Laporan Ops Sore / Evaluasi Hari Ini (dirangkum Claude)
+cron.schedule('30 17 * * *', async () => { await sendOpsSummary('sore'); }, { timezone:'Asia/Jakarta' });
 
 // 17:00 WIB — Reminder H-1
 cron.schedule('0 17 * * *', async () => {
@@ -1999,6 +2049,57 @@ async function dailySentralTrackingReport() {
   } catch (e) {
     console.error('dailySentralTrackingReport error:', e.message);
     await sendToTargets(`❌ Gagal generate laporan Sentral Cargo:\n${e.message}`);
+  }
+}
+
+// ─── PESAN FU KE SENTRAL CARGO (ON-DEMAND) ───────────────────
+// Ambil order Sentral Cargo yang overdue atau sisa SLA <=1 hari,
+// cek posisi realtime, lalu susun jadi pesan siap-forward ke partner.
+async function buildFUSentralMessage() {
+  try {
+    clearCache('sheetData');
+    const data = await getSheetData();
+    if (!data || data.length < 2) return '❌ Gagal ambil data sheet.';
+
+    const today = getToday();
+    const candidates = [];
+
+    for (let i = 1; i < data.length; i++) {
+      const row      = data[i];
+      const eks      = (row[COL.ekspedisi] || '').trim();
+      const resi     = (row[COL.resi]      || '').trim();
+      const status   = (row[COL.status]    || '').trim().toLowerCase();
+      const slaStr   = (row[COL.sla]       || '').trim();
+
+      if (!eks.match(/sentral\s*cargo/i)) continue;
+      if (['delivered', 'received', 'return'].includes(status)) continue;
+      if (!resi) continue;
+
+      const sisaSLA = slaStr ? Math.round((new Date(slaStr) - new Date(today)) / 86400000) : null;
+      if (sisaSLA === null || sisaSLA > 1) continue; // hanya overdue & berisiko (sisa <=1 hari)
+
+      candidates.push({ resi, sisaSLA });
+    }
+
+    if (!candidates.length) return '👍 Tidak ada order Sentral Cargo yang berisiko/telat SLA saat ini.';
+
+    const lines = [];
+    for (const c of candidates) {
+      await new Promise(r => setTimeout(r, 600)); // hindari rate limit ke situs Sentral Cargo
+      const result = await cekResiSentralCargo(c.resi);
+      const posisi = result.ok ? result.posisi : `tidak bisa dicek posisinya (${result.msg})`;
+      const label  = c.sisaSLA < 0 ? `overdue ${Math.abs(c.sisaSLA)} hari` : `sisa SLA ${c.sisaSLA} hari`;
+      lines.push(`${lines.length + 1}. ${c.resi} — posisi ${posisi}, ${label}`);
+    }
+
+    return (
+      `Halo min Sentral Cargo, mohon bantu cek resi berikut yang berpotensi/sudah telat:\n\n` +
+      lines.join('\n') +
+      `\n\nMohon update & percepatannya ya, terima kasih 🙏`
+    );
+  } catch (e) {
+    console.error('buildFUSentralMessage error:', e.message);
+    return `❌ Error saat menyusun pesan FU: ${e.message}`;
   }
 }
 
