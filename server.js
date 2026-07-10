@@ -185,12 +185,39 @@ async function updateOrderField(noOrder, colIdx, colName, newValue, updatedBy) {
   return false;
 }
 
+// ─── PENCARIAN ORDER (BERTINGKAT: EXACT DULU, BARU PARTIAL) ─
+// Mencegah row tertukar ketika dua order berbeda kebetulan
+// punya digit yang sama di kolom No Order vs Shipping Number.
+function findOrderRows(rows, query) {
+  const q = (query || '').trim().toLowerCase();
+  if (!q) return [];
+  const norm = v => (v || '').toString().trim().toLowerCase();
+
+  // Tier 1: exact match di No Order (paling spesifik & prioritas utama)
+  let m = rows.filter(r => norm(r[COL.noOrder]) === q);
+  if (m.length) return m;
+
+  // Tier 2: exact match di Shipping Number
+  m = rows.filter(r => norm(r[COL.shippingNum]) === q);
+  if (m.length) return m;
+
+  // Tier 3: partial match di No Order saja
+  m = rows.filter(r => norm(r[COL.noOrder]).includes(q));
+  if (m.length) return m;
+
+  // Tier 4: partial match di Shipping Number saja (fallback terakhir)
+  m = rows.filter(r => norm(r[COL.shippingNum]).includes(q));
+  return m;
+}
+
 async function getOrderByNumber(noOrder) {
   const data = await getSheetData(); if (!data || data.length < 2) return null;
-  for (let i = 1; i < data.length; i++) {
-    if ((data[i][COL.noOrder] || '').includes(noOrder) || (data[i][COL.shippingNum] || '').includes(noOrder)) return data[i];
+  const rows = data.slice(1);
+  const matches = findOrderRows(rows, noOrder);
+  if (matches.length > 1) {
+    console.warn(`[getOrderByNumber] Ambigu: "${noOrder}" cocok dengan ${matches.length} order. Pakai yang pertama.`);
   }
-  return null;
+  return matches[0] || null;
 }
 
 // ─── MEMORY ───────────────────────────────────────────────
@@ -254,7 +281,7 @@ async function buildReminderMsg(reminder, label) {
   const orders = [];
   if (data && noOrders.length > 0) {
     for (const no of noOrders) {
-      const row = data.slice(1).find(r => (r[COL.noOrder] || '').includes(no) || (r[COL.shippingNum] || '').includes(no));
+      const row = findOrderRows(data.slice(1), no)[0];
       if (row) orders.push(row);
     }
   }
@@ -441,7 +468,7 @@ function filterData(data, intent, message) {
     case 'overdue': filtered = rows.filter(r => { const s = r[COL.sla]; return s && s < today && (r[COL.status] || '').toLowerCase() !== 'received'; }); break;
     case 'sla_alert': filtered = rows.filter(r => { const s = r[COL.sla]; if (!s || (r[COL.status] || '').toLowerCase() === 'received') return false; const d = Math.round((new Date(s) - new Date(today)) / 86400000); return d >= -1 && d <= 2; }); break;
     case 'shipped_today': filtered = rows.filter(r => (r[COL.tglPengiriman] || '').startsWith(today)); break;
-    case 'specific_order': const on = (message.match(/\d{6,}/) || [])[0]; filtered = on ? rows.filter(r => (r[COL.noOrder] || '').includes(on) || (r[COL.shippingNum] || '').includes(on)) : rows.slice(-50); break;
+    case 'specific_order': const on = (message.match(/\d{6,}/) || [])[0]; filtered = on ? findOrderRows(rows, on) : []; break;
     case 'customer_search': const ws = message.split(/\s+/).filter(w => w.length > 3); filtered = rows.filter(r => ws.some(w => (r[COL.customer] || '').toLowerCase().includes(w.toLowerCase()))); break;
     case 'ekspedisi': const ek = ['jne','j&t','jnt','sicepat','anteraja','ninja','tiki','lion','jnl','deliveree','sentral'].find(k => message.toLowerCase().includes(k)); filtered = ek ? rows.filter(r => (r[COL.ekspedisi] || '').toLowerCase().includes(ek)) : rows.slice(-100); break;
     case 'reminder': case 'list_reminder': case 'format3_reminder': return null;
@@ -578,6 +605,8 @@ NO ORDER + REMARK → ACTION:UPDATE_REMARK:[no_order]:[remark]
 - ACTION hanya di akhir pesan, tidak ditampilkan ke user
 - Kalau di luar konteks ops logistik → "Gatau sih 😅"
 - Konfirmasi sebelum update kecuali Format 1,2,3 yang sudah jelas
+- WAJIB: field "query" saat panggil get_order_data untuk intent specific_order HARUS berisi persis nomor/angka yang diketik user (jangan diparafrase atau dihilangkan)
+- WAJIB: kalau hasil tool get_order_data mengembalikan total:0 atau rows kosong, JANGAN pernah mengarang/menebak data order (nama customer, resi, kota, dll). Jawab jujur bahwa order tidak ditemukan di data, minta user cek ulang nomornya
 `.trim();
 
 // ─── TOOL DEFINITIONS ─────────────────────────────────────
@@ -663,7 +692,7 @@ const TOOLS = [
 ];
 
 // ─── TOOL EXECUTOR ────────────────────────────────────────
-async function executeTool(toolName, toolInput, senderId, senderName) {
+async function executeTool(toolName, toolInput, senderId, senderName, userMessage = '') {
   console.log(`[Tool] ${toolName}:`, JSON.stringify(toolInput));
   try {
     switch (toolName) {
@@ -671,7 +700,11 @@ async function executeTool(toolName, toolInput, senderId, senderName) {
       case 'get_order_data': {
         const rawData = await getSheetData();
         if (!rawData) return { error: 'Gagal ambil data sheet' };
-        const result = filterData(rawData, toolInput.intent, toolInput.query || '');
+        // Gabungkan query dari Claude + pesan asli user sebagai jaring pengaman:
+        // kalau Claude lupa/salah menyertakan nomor order di `query`, angka
+        // dari pesan asli tetap bisa dipakai untuk pencarian yang akurat.
+        const searchText = `${toolInput.query || ''} ${userMessage || ''}`.trim();
+        const result = filterData(rawData, toolInput.intent, searchText);
         if (!result) return { rows: [], total: 0 };
         return { rows: result.rows.slice(0, 50), total: result.rows.length };
       }
@@ -845,7 +878,7 @@ async function callClaude(senderId, senderName, userMessage, imageBase64 = null,
       const toolUseBlocks = response.content.filter(b => b.type === 'tool_use');
       const toolResults   = await Promise.all(
         toolUseBlocks.map(async (block) => {
-          const result = await executeTool(block.name, block.input, senderId, senderName);
+          const result = await executeTool(block.name, block.input, senderId, senderName, userMessage);
           return {
             type        : 'tool_result',
             tool_use_id : block.id,
