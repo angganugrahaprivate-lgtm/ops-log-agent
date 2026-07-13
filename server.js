@@ -1180,6 +1180,39 @@ app.post('/webhook/wa', async (req, res) => {
   const senderId = `wa_${sender}`;
   console.log(`WA [${senderName}${isGroup?'/GROUP':''}]: "${(message||'').substring(0,60)}" file=${!!file}`);
 
+  // ── INTER-AGENT: Handle DSB-REQUEST dari DSB Agent ──────────────────────
+// Format: [DSB-REQUEST:CORRELATIONID|REQUESTERWA] query
+if (message && /^\[DSB-REQUEST:[A-Z0-9]+\|\d+\]/.test(message)) {
+  try {
+    const match = message.match(/^\[DSB-REQUEST:([A-Z0-9]+)\|(\d+)\]\s*([\s\S]*)/);
+    if (match) {
+      const correlationId = match[1];
+      const requesterWA   = match[2];
+      const query         = match[3].trim();
+
+      console.log(`[DSB-REQUEST] ID:${correlationId} from:${requesterWA} query:${query}`);
+
+      // Proses query via Claude (reuse callClaude)
+      const dsbSenderId = `dsb_${correlationId}`;
+      const reply = await callClaude(dsbSenderId, 'DSB Agent', query);
+
+      // Balas ke nomor DSB Agent Fonnte dengan format [DSB-REPLY:ID]
+      const DSB_FONNTE_WA = process.env.DSB_FONNTE_WA || '';
+      if (DSB_FONNTE_WA) {
+        const replyMsg = `[DSB-REPLY:${correlationId}] ${reply}`;
+        await sendWA(DSB_FONNTE_WA, replyMsg);
+        console.log(`[DSB-REPLY] Sent to ${DSB_FONNTE_WA}: ID ${correlationId}`);
+      } else {
+        console.warn('[DSB-REQUEST] DSB_FONNTE_WA env var tidak diset!');
+      }
+    }
+  } catch (e) {
+    console.error('[DSB-REQUEST] Error:', e.message);
+  }
+  return;
+}
+// ── END INTER-AGENT ──────────────────────────────────────────────────────
+  
   try {
     // GROUP MESSAGE
     if (isGroup) {
